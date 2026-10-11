@@ -1,92 +1,147 @@
 // -----------------------------------------------------------------------------
 // Median Filter
 // Copyright (C) 2017-2019 by Xose Pérez <xose dot perez at gmail dot com>
+// Copyright (C) 2023-2024 by Maxim Prokhorov <prokhorov dot max at outlook dot com>
 // -----------------------------------------------------------------------------
-
-#if SENSOR_SUPPORT
 
 #pragma once
 
 #include "BaseFilter.h"
 
+#include <algorithm>
+#include <vector>
+
 class MedianFilter : public BaseFilter {
-
-    public:
-
-        ~MedianFilter() {
-            if (_data) delete _data;
+public:
+    void update(double value) override {
+        // Inserted value is always with the last index
+        if (!_size) {
+            return;
         }
 
-        void add(double value) {
-            if (_pointer <= _size) {
-                _data[_pointer] = value;
-                _pointer++;
+        const auto size = _values.size();
+        auto pending =
+            Value{
+                .value = value,
+                .index = size,
+            };
+
+        // Special case for initial state
+        if (!_values.size()) {
+            _values.push_back(pending);
+            return;
+        }
+
+        // Pop first element by index, shift everything else down
+        if (_values.size() == _size) {
+            const auto it = std::find_if(
+                _values.begin(),
+                _values.end(),
+                [&](const Value& value) {
+                    return value.index == 0;
+                });
+
+            _values.erase(it);
+            for (auto& entry : _values) {
+                --entry.index;
             }
+
+            pending.index -= 1;
         }
 
-        unsigned char count() {
-            return _pointer;
+        // Defensively sort the values vector
+        const auto upper = std::upper_bound(
+            _values.begin(), _values.end(), pending,
+            [](const Value& lhs, const Value& rhs) {
+                return lhs.value < rhs.value;
+            });
+        _values.insert(upper, pending);
+    }
+
+    double value() const override {
+        // Special case when early report triggers value read
+        if (_values.size() == 1) {
+            return _values.front().value;
+        } else if (_values.size() == 2) {
+            return (_values.front().value + _values.back().value) / 2.0;
+        // Otherwise, pick out the middle section and average it
+        } else if (0 == (_values.size() % 2)) {
+            const auto lhs = _values.begin() + ((_values.size() / 2) - 1);
+            const auto rhs = std::next(lhs);
+
+            return ((*lhs).value + (*rhs).value) / 2.0;
         }
 
-        void reset() {
-            if (_pointer > 0) {
-                _data[0] = _data[_pointer-1];
-                _pointer = 1;
-            } else {
-                _pointer = 0;
-            }
+        // ...or, use the middle element as-is
+        const auto it = _values.begin() + (_values.size() / 2);
+        return (*it).value;
+    }
+
+    bool available() const override {
+        return _values.size() > 0;
+    }
+
+    bool ready() const override {
+        return (_size > 0)
+            && (_values.size() == _size);
+    }
+
+    void resize(size_t size) override {
+        _resize(size);
+    }
+
+    void reset() override {
+        _values.clear();
+    }
+
+private:
+    void _resize(size_t size) {
+        if (!size) {
+            _values.clear();
+            _values.shrink_to_fit();
+        } else if ((size < _size) && _values.size()) {
+            _reset_offset(_size - size);
+        } else if (size > _size) {
+            _values.reserve(size);
         }
 
-        double result() {
+        _size = size;
+    }
 
-            double sum = 0;
-
-            if (_pointer > 2) {
-
-                for (unsigned char i = 1; i <= _pointer - 2; i++) {
-
-                    // For each position,
-                    // we find the median with the previous and next value
-                    // and use that for the sum
-
-                    double previous = _data[i-1];
-                    double current = _data[i];
-                    double next = _data[i+1];
-
-                    if (previous > current) std::swap(previous, current);
-                    if (current > next) std::swap(current, next);
-                    if (previous > current) std::swap(previous, current);
-
-                    sum += current;
-
+    void _reset_offset(size_t offset) {
+        const auto it = std::remove_if(
+            _values.begin(),
+            _values.end(),
+            [&](Value& value) {
+                const auto remove = value.index < offset;
+                if (!remove) {
+                    value.index -= offset;
                 }
 
-                sum /= (_pointer - 2);
+                return remove;
+            });
 
-            } else if (_pointer > 0) {
-
-                sum = _data[0];
-
-            }
-
-            return sum;
-
+        if (it != _values.end()) {
+            _values.erase(it, _values.end());
+            _values.shrink_to_fit();
         }
+    }
 
-        void resize(unsigned char size) {
-            if (_size == size) return;
-            _size = size;
-            if (_data) delete _data;
-            _data = new double[_size+1];
-            for (unsigned char i=0; i<=_size; i++) _data[i] = 0;
-            _pointer = 0;
-        }
+    void _reset(size_t size) {
+        _values.clear();
+        _resize(size);
+    }
 
-    protected:
+    void _reset() {
+        _reset(_size);
+    }
 
-        unsigned char _pointer = 0;
-        double * _data = NULL;
+    // Track input index, since '_values' is sorted by 'value'
+    struct Value {
+        double value;
+        size_t index;
+    };
 
+    std::vector<Value> _values {};
+    size_t _size { 0 };
 };
-
-#endif // SENSOR_SUPPORT

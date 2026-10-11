@@ -1,0 +1,59 @@
+<form id="form-tspk" class="pure-form pure-form-aligned form-settings">
+    <div class="panel" id="panel-tspk">
+
+        <div class="header">
+            <h1>THINGSPEAK</h1>
+            <h2>
+                Send your sensors data to Thingspeak.
+            </h2>
+        </div>
+
+        <div class="page">
+
+            <fieldset>
+
+                <legend>General</legend>
+
+                <div class="pure-control-group">
+                    <label>Enabled</label>
+                    <input class="checkbox-toggle" type="checkbox" name="tspkEnabled">
+                </div>
+
+                <div class="pure-control-group">
+                    <label>Clear cache</label>
+                    <input class="checkbox-toggle" type="checkbox" name="tspkClear">
+                    <span class="pure-form-message">
+                        With every POST to thinkspeak.com only enqueued fields are sent.<br>
+                        If you select to clear the cache after every sending this will result in only those fields that have changed will be posted.
+                        If you want all fields to be sent with every POST do not clear the cache.
+                    </span>
+                </div>
+
+                <div class="pure-control-group">
+                    <label>Address</label>
+                    <input class="pure-input-2-3" name="tspkAddress" type="text" required >
+                </div>
+
+                <div class="pure-control-group">
+                    <label>API Key</label>
+                    <input class="pure-input-2-3" name="tspkKey" type="text" required >
+                </div>
+            </fieldset>
+
+            <p class="pure-form-message">
+                Enter the field number to send each data to. Set to 0 to disable notifications from that component.
+            </p>
+
+            <fieldset class="module module-relay">
+                <legend>Relays</legend>
+                <div id="tspk-relays" class="settings-group" ></div>
+            </fieldset>
+
+            <fieldset class="module module-sns">
+                <legend>Sensors</legend>
+                <div id="tspk-magnitudes" class="settings-group" ></div>
+            </fieldset>
+        </div>
+
+    </div>
+</form>

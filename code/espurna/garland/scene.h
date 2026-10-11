@@ -7,11 +7,6 @@ Inspired by https://github.com/Vasil-Pahomov/ArWs2812 (currently https://github.
 
 #pragma once
 
-#if GARLAND_SUPPORT
-
-#include <array>
-#include <vector>
-
 #include "anim.h"
 #include "animations/anim_assemble.h"
 #include "animations/anim_comets.h"
@@ -20,8 +15,8 @@ Inspired by https://github.com/Vasil-Pahomov/ArWs2812 (currently https://github.
 #include "animations/anim_fly.h"
 #include "animations/anim_glow.h"
 #include "animations/anim_pixiedust.h"
+#include "animations/anim_randrun.h"
 #include "animations/anim_randcyc.h"
-#include "animations/anim_run.h"
 #include "animations/anim_salut.h"
 #include "animations/anim_sparkr.h"
 #include "animations/anim_spread.h"
@@ -29,44 +24,52 @@ Inspired by https://github.com/Vasil-Pahomov/ArWs2812 (currently https://github.
 #include "animations/anim_start.h"
 #include "animations/anim_waves.h"
 
-class Adafruit_NeoPixel;
-class Palette;
+#define GARLAND_SCENE_SPEED_MAX          70
+#define GARLAND_SCENE_SPEED_FACTOR       10
+#define GARLAND_SCENE_DEFAULT_SPEED      40
 
+template <uint16_t Leds>
 class Scene {
 public:
-    Scene(Adafruit_NeoPixel* pixels);
+    Scene(Adafruit_NeoPixel* pixels) : _pixels(pixels) {}
+    constexpr uint16_t getLeds() const { return Leds; }
 
+    bool finishedAnimCycle() { return _anim ? _anim->finishedycle() : true; }
+    unsigned long getAvgCalcTime() { return calc_num > 0 ? sum_calc_time / calc_num : 0; }
+    unsigned long getAvgPixlTime() { return pixl_num > 0 ? sum_pixl_time / pixl_num : 0; }
+    unsigned long getAvgShowTime() { return show_num > 0 ? sum_show_time / show_num : 0; }
+    int getNumShows() { return numShows; }
+    byte getBrightness() { return brightness; }
+    byte getSpeed() { return speed; }
+    float getCycleFactor(byte speed) { return (float)(GARLAND_SCENE_SPEED_MAX - speed) / GARLAND_SCENE_SPEED_FACTOR; }
+    Palette* getPalette() const { return _palette; }
+    Anim* getAnim() const { return _anim; }
 
-    void setPalette(Palette* palette);
-    void setBrightness(byte brightness);
-    byte getBrightness();
-    void setSpeed(byte speed);
-    byte getSpeed();
-    void setDefault();
     void setAnim(Anim* anim) { _anim = anim; }
+    void setPalette(Palette* palette);
+    void setPals(Palette* palettes, size_t palsNum) { _pals = palettes; _palsNum = palsNum; }
+    void setBrightness(byte value);
+    void setSpeed(byte speed);
+    void setDefault();
     void run();
     void setup();
-    bool finishedAnimCycle() { return _anim ? _anim->finishedycle() : true; }
-    unsigned long getAvgCalcTime();
-    unsigned long getAvgPixlTime();
-    unsigned long getAvgShowTime();
-    int getNumShows() { return numShows; }
 
 private:
     Adafruit_NeoPixel* _pixels = nullptr;
-    uint16_t           _numLeds;
     //Color arrays - two for making transition
-    std::vector<Color> _leds1;
-    std::vector<Color> _leds2;
+    std::array<Color, Leds> _leds1;
+    std::array<Color, Leds> _leds2;
     // array of Colorfor anim to currently work with
     Color*             _leds = nullptr;
     Anim*              _anim = nullptr;
 
     //auxiliary colors array for mutual usage of anims
-    std::vector<Color> _ledstmp;
-    std::vector<byte>  _seq;
+    std::array<Color, Leds> _ledstmp;
+    std::array<byte, Leds>  _seq;
 
     Palette*           _palette = nullptr;
+    Palette*           _pals = nullptr;
+    size_t             _palsNum = 0;
 
     // millis to transition end
     unsigned long      transms;
@@ -77,13 +80,13 @@ private:
     // if cycleFactor is 2 or more, than calculation and drawing made in different cycles
     // cycleFactor is float. For example cycleFactor=2.5 gives one step 2 than next 3 cycles per anim step
     // Recommended values: 1 < cycleFactor < 4
-    float              cycleFactor = 2.0;
+    float              cycleFactor = getCycleFactor(GARLAND_SCENE_DEFAULT_SPEED);
     // speed is reverse to cycleFactor. For forward direction control of animation speed.
     // Recommended values: 30 < speed < 60.
-    // Correspondence: 
+    // Correspondence:
     //   speed=60, cycleFactor=1
     //   speed=30, cycleFactor=4
-    byte               speed = 50;
+    byte               speed = GARLAND_SCENE_DEFAULT_SPEED;
     float              cycleTail = 0;
     int                cyclesRemain = 0;
 
@@ -119,5 +122,3 @@ private:
 
     void setupImpl();
 };
-
-#endif  // GARLAND_SUPPORT

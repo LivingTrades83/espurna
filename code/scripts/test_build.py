@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Copyright (C) 2019 by Maxim Prokhorov <prokhorov dot max at outlook dot com>
+# Copyright (C) 2019-2021 by Maxim Prokhorov <prokhorov dot max at outlook dot com>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -15,166 +15,264 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-from __future__ import print_function
-
-import time
-import glob
 import argparse
-import atexit
-import subprocess
-import os
-import sys
 import datetime
+import logging
+import os
+import pathlib
+import subprocess
+import time
 
-from espurna_utils.display import clr, print_warning, Color
+from espurna_utils.display import clr, Color
 
-
-def restore_source_tree(files):
-    cmd = ["git", "checkout", "-f", "--"]
-    cmd.extend(files)
-    subprocess.check_call(cmd)
-
-
-def try_remove(path):
-    try:
-        os.remove(path)
-    except:  # pylint: disable=bare-except
-        print_warning("Please manually remove the file `{}`".format(path))
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("main")
 
 
-total_time = 0
+PWD = pathlib.Path(__file__).resolve().parent
+
+ROOT_PATH = (PWD / "..").resolve()
+TEST_PATH = (ROOT_PATH / "test" / "build").resolve()
+
+CONFIG_PATH = TEST_PATH / "config"
+CACHE_PATH = TEST_PATH / "cache"
+BUILD_PATH = ROOT_PATH / ".pio" / "build"
+
+CACHE_TIMEDELTA = datetime.timedelta(days=1)
+TIMEDELTA_PARAM = {
+    "d": "days",
+    "h": "hours",
+    "m": "minutes",
+    "s": "seconds",
+}
 
 
-def print_total_time():
-    print()
-    print(
-        clr(
-            Color.BOLD,
-            "> Total time: {}".format(datetime.timedelta(seconds=total_time)),
-        )
-    )
+def bold(string: str):
+    return clr(Color.BOLD, string)
 
 
-def run_configurations(args, configurations):
+def format_configurations(configurations: list[pathlib.Path]):
+    return "\n".join(str(cfg) for cfg in configurations)
+
+
+def pluralize(string: str, length: int):
+    if length > 1:
+        return f"{string}s"
+
+    return string
+
+
+def make_timedelta(string: str) -> datetime.timedelta:
+    if not string:
+        return datetime.timedelta(seconds=0)
+
+    if string.isdigit():
+        suffix = "d"
+    else:
+        suffix = string[-1]
+        string = string[:-1]
+
+    param = TIMEDELTA_PARAM[suffix]
+    value = int(string, 10)
+
+    return datetime.timedelta(**{param: value})
+
+
+def cache_cleanup(cache_path: pathlib.Path, offset: datetime.timedelta):
+    now = datetime.datetime.now()
+
+    for pair in cache_path.iterdir():
+        # {CACHE_DIR} / AA / AA...rest of the hash...
+        if not pair.is_dir():
+            continue
+
+        for f in pair.iterdir():
+            mtime_raw = f.stat().st_mtime
+            mtime_dt = datetime.datetime.fromtimestamp(mtime_raw)
+
+            if now - mtime_dt > offset:
+                f.unlink()
+
+        if not any(pair.iterdir()):
+            pair.rmdir()
+
+
+def build_configurations(args: argparse.Namespace, configurations: list[pathlib.Path]):
+    cache_path = args.cache_path.resolve()
+
+    if cache_path.is_dir():
+        cache_cleanup(cache_path, args.expire_cache)
+
     cmd = ["platformio", "run"]
-    if not args.no_silent:
+    if args.silent:
         cmd.extend(["-s"])
     cmd.extend(["-e", args.environment])
 
-    for cfg in configurations:
-        print(clr(Color.BOLD, "> Building {}".format(cfg)), flush=True)
-        with open(args.custom_h, "w") as custom_h:
+    build_time = datetime.timedelta(seconds=0)
 
-            def write(line):
-                sys.stdout.write(line)
-                custom_h.write(line)
-
-            name, _ = os.path.splitext(cfg)
-            name = os.path.basename(name)
-            write('#define MANUFACTURER "TEST_BUILD"\n')
-            write('#define DEVICE "{}"\n'.format(name.upper()))
-            with open(cfg, "r") as cfg_file:
-                for line in cfg_file:
-                    write(line)
+    while configurations:
+        cfg = configurations.pop()
+        log.info("%s contents\n%s", bold(cfg.name), cfg.read_text())
 
         os_env = os.environ.copy()
-        os_env["PLATFORMIO_SRC_BUILD_FLAGS"] = "-DUSE_CUSTOM_H"
-        os_env["PLATFORMIO_BUILD_CACHE_DIR"] = "test/pio_cache"
-        if not args.no_single_source:
+        os_env["PLATFORMIO_BUILD_CACHE_DIR"] = cache_path.resolve().as_posix()
+        if args.single_source:
             os_env["ESPURNA_BUILD_SINGLE_SOURCE"] = "1"
 
-        start = time.time()
-        subprocess.check_call(cmd, env=os_env)
-        diff = time.time() - start
+        os_env["PLATFORMIO_BUILD_SRC_FLAGS"] = " ".join(
+            [
+                '-DMANUFACTURER=\\"TEST_BUILD\\"',
+                '-DDEVICE=\\"{}\\"'.format(cfg.stem.replace(" ", "_").upper()),
+                '-include "{}"'.format(cfg.resolve().as_posix()),
+            ]
+        )
 
-        global total_time
-        total_time += diff
+        build_start = time.time()
+        try:
+            subprocess.check_call(cmd, env=os_env)
+        except subprocess.CalledProcessError:
+            log.error("%s failed to build", bold(str(cfg)))
+            if configurations:
+                log.info(
+                    "%s %s left\n%s",
+                    bold(str(len(configurations))),
+                    pluralize("configuration", len(configurations)),
+                    format_configurations(configurations),
+                )
+            raise
 
-        print(
-            clr(
-                Color.BOLD,
-                "> {}: {} bytes, {}".format(
-                    cfg,
-                    os.stat(
-                        os.path.join(".pio", "build", args.environment, "firmware.bin")
-                    ).st_size,
-                    datetime.timedelta(seconds=diff),
-                ),
+        diff = datetime.timedelta(seconds=time.time() - build_start)
+
+        firmware_bin = args.build_path / args.environment / "firmware.bin"
+
+        log.info(
+            "%s finished in %s, %s is %s bytes",
+            *(
+                bold(str(x))
+                for x in (cfg, diff, firmware_bin, firmware_bin.stat().st_size)
             ),
-            flush=True,
         )
 
+        build_time += diff
 
-def main(args):
-    if os.path.exists(args.custom_h):
-        raise SystemExit(
-            clr(
-                Color.YELLOW,
-                "{} already exists, please run this script in a git-worktree(1) or a separate directory".format(
-                    args.custom_h
-                ),
-            )
-        )
+    if build_time:
+        log.info("Done after %s", bold(str(build_time)))
 
-    configurations = []
-    if not args.no_default:
-        configurations = list(glob.glob(args.default_configurations))
 
-    configurations.extend(x for x in (args.add or []))
-    if not configurations:
-        raise SystemExit(clr(Color.YELLOW, "No configurations selected"))
-
-    if len(configurations) > 1:
-        atexit.register(print_total_time)
-
-    print(clr(Color.BOLD, "> Selected configurations:"))
-    for cfg in configurations:
-        print(cfg)
-    if args.list:
+def main(args: argparse.Namespace):
+    if not args.environment:
+        log.error("No environment selected")
         return
 
-    if not args.environment:
-        raise SystemExit(clr(Color.YELLOW, "No environment selected"))
-    print(clr(Color.BOLD, "> Selected environment: {}".format(args.environment)))
+    log.info("Using [env:%s]", bold(args.environment))
 
-    atexit.register(try_remove, args.custom_h)
+    configurations = [pathlib.Path(x) for x in args.configurations]
+    if not configurations:
+        configurations = [x for x in args.config_path.glob("*.h")]
 
-    run_configurations(args, configurations)
+    configurations = [x.resolve() for x in configurations]
+
+    if args.start_from:
+        offset = 0
+        for n, p in enumerate(configurations, start=1):
+            if args.start_from in p.name:
+                offset = n
+                break
+
+        if offset:
+            for cfg in configurations[offset:]:
+                log.info("Skipping %s", cfg)
+            configurations = configurations[:offset]
+
+    if args.filter:
+        configurations = [p for p in configurations for f in args.filter if f in p.name]
+
+    if not configurations:
+        log.error("No configurations selected")
+        return
+
+    log.info(
+        "Found %s %s\n%s",
+        bold(str(len(configurations))),
+        pluralize("configuration", len(configurations)),
+        format_configurations(configurations),
+    )
+
+    if args.build:
+        build_configurations(args, configurations)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-l", "--list", action="store_true", help="List selected configurations"
-    )
-    parser.add_argument(
-        "--custom-h",
-        default="espurna/config/custom.h",
-        help="Header that will be included in by the config/all.h",
-    )
-    parser.add_argument(
-        "-n",
-        "--no-default",
-        action="store_true",
-        help="Do not use default configurations (--default-configurations=...)",
-    )
-    parser.add_argument(
-        "-a",
-        "--add",
-        action="append",
-        help="Add path to selected configurations (can specify multiple times)",
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("-e", "--environment", help="PIO environment")
+
     parser.add_argument(
-        "--default-configurations",
-        default="test/build/*.h",
-        help="(glob) default configuration headers",
+        "--start-from",
+        help="Skip configurations until this string is found in configuration filename",
+        default="",
     )
+
     parser.add_argument(
-        "--no-silent", action="store_true", help="Do not silence pio-run"
+        "--filter",
+        action="append",
+        help="Only build configurations with filenames containing this string",
     )
+
     parser.add_argument(
-        "--no-single-source", action="store_true", help="Disable 'unity' build"
+        "--silent",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Silence PlatformIO output",
+    )
+
+    parser.add_argument(
+        "--single-source",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use SCons 'unity' build",
+    )
+
+    parser.add_argument(
+        "--build",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Build specified configurations",
+    )
+
+    parser.add_argument(
+        "--config-path",
+        default=CONFIG_PATH,
+        type=pathlib.Path,
+        help="Directory with build test configuration headers",
+    )
+
+    parser.add_argument(
+        "--cache-path",
+        default=CACHE_PATH,
+        type=pathlib.Path,
+        help="PlatformIO SCons cache path",
+    )
+
+    parser.add_argument(
+        "--build-path",
+        default=BUILD_PATH,
+        type=pathlib.Path,
+        help="PlatformIO build path",
+    )
+
+    parser.add_argument(
+        "--expire-cache",
+        default=CACHE_TIMEDELTA,
+        type=make_timedelta,
+        help="PlatformIO cache expiration time (NUMBER or NUMBER{d,h,m,s} for days, hours, minutes or seconds respectively)}",
+    )
+
+    parser.add_argument(
+        "configurations",
+        nargs="*",
+        default=[],
     )
 
     main(parser.parse_args())

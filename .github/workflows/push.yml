@@ -1,58 +1,112 @@
-# Check the build status for the nighly builder, release or pull request
+name: PlatformIO Build
 
-name: ESPurna build
-
-on: [push, pull_request]
+on:
+  push:
+    branches:
+      - dev
+      - 'test/**'
+    tags-ignore: '**'
+  pull_request:
+    branches: [dev]
 
 jobs:
+  check-generated:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/setup-python@v7
+      with:
+        python-version: '3.x'
+    - name: Check generated files
+      run: |
+        ./ci_script.sh generated
+
   test:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-    - uses: actions/setup-python@v2
+    - uses: actions/checkout@v7
+    - uses: actions/setup-python@v7
       with:
         python-version: '3.x'
-    - name: Cache PlatformIO
-      uses: actions/cache@v2
+    - name: Cache CMake
+      uses: actions/cache@v6
       with:
-        path: ~/.platformio
-        key: ${{ runner.os }}-${{ hashFiles('code/platformio.ini') }}
+        path: code/test/unit/cache
+        key: ${{ runner.os }}-cmake-${{ hashFiles('code/test/unit/CMakeLists.txt') }}
     - name: Host tests
       run: |
         ./ci_install.sh host
         ./ci_script.sh host
-  build:
+
+  webui:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-    - uses: actions/setup-python@v2
+    - uses: actions/checkout@v7
+    - uses: actions/setup-node@v7
       with:
-        python-version: '3.x'
-    - uses: actions/setup-node@v2
-      with:
-        node-version: '14'
+        node-version: 'lts/*'
     - name: Cache Node
-      uses: actions/cache@v2
+      uses: actions/cache@v6
       with:
         path: ~/.npm
-        key: ${{ runner.os }}-${{ hashFiles('code/package-lock.json', 'code/package.json') }}
-    - name: Cache PlatformIO
-      uses: actions/cache@v2
-      with:
-        path: ~/.platformio
-        key: ${{ runner.os }}-${{ hashFiles('code/platformio.ini') }}
+        key: ${{ runner.os }}-npm-${{ hashFiles('code/package-lock.json', 'code/package.json') }}
     - name: WebUI tests
       run: |
         ./ci_install.sh webui
         ./ci_script.sh webui
-    - name: PlatformIO build
-      env:
-        BUILDER_TOTAL_THREADS: 4
-        ESPURNA_PIO_PATCH_ISSUE_1610: "y"
-        ESPURNA_PIO_SHARED_LIBRARIES: "y"
-        TEST_ENV: "esp8266-4m-latest-base"
-        TEST_EXTRA_ARGS: "-a test/build/extra/secure_client.h"
+    - name: Archive blobs
+      run: |
+        pushd code/html/
+        time zip \
+          --quiet \
+          --recurse-paths \
+          WebUI-${{ github.sha }}.zip build/
+        mv WebUI-${{ github.sha }}.zip ../../
+        popd
+    - uses: actions/upload-artifact@v7
+      with:
+        name: WebUI-${{ github.sha }}
+        path: WebUI-${{ github.sha }}.zip
+
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [nodemcu-lolin, esp8266-4m-base, esp8266-4m-latest-base]
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/setup-python@v7
+      with:
+        python-version: '3.x'
+    - name: Cache pip
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('ci_install.sh') }}
+    - name: Cache PlatformIO
+      uses: actions/cache@v6
+      with:
+        path: ~/.platformio
+        key: ${{ runner.os }}-build-${{ matrix.env }}-${{ hashFiles('code/platformio.ini') }}
+        restore-keys: |
+          ${{ runner.os }}-build-${{ matrix.env }}-
+          ${{ runner.os }}-build-
+    - name: Cache libraries
+      uses: actions/cache@v6
+      with:
+        path: libraries/
+        key: ${{ runner.os }}-libraries-${{ hashFiles('code/platformio.ini') }}
+        restore-keys: |
+          ${{ runner.os }}-libraries-
+    - name: PlatformIO prepare
       run: |
         git config --global advice.detachedHead false
-        ./ci_install.sh build
-        ./ci_script.sh build
+        ./ci_install.sh build ${{ matrix.env }}
+    - if: ${{ matrix.env == 'nodemcu-lolin' }}
+      name: Basic build
+      run: |
+        ./ci_script.sh build ${{ matrix.env }}
+    - if: ${{ endsWith(matrix.env, '-base') }}
+      name: Test build
+      run: |
+        ./ci_script.sh test ${{ matrix.env }}

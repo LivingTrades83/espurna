@@ -1,0 +1,31 @@
+<form id="form-led" class="pure-form form-settings">
+    <div class="panel" id="panel-led">
+
+        <div class="header">
+            <h1>LED</h1>
+            <h2>Notification LED configuration</h2>
+        </div>
+
+        <div class="page">
+
+            <details>
+
+            <summary>Available modes</summary>
+            <ul class="pure-u-1 pure-u-lg-3-4">
+                <li><code>wifi</code><p>blink once per second when attempting to connect. If successfully connected it will briefly power the led ON every 5 seconds if in STA mode, or every second if the device is in AP mode.</p></li>
+                <li><code>relay</code> and <code>relay-inverse</code> - follow the status of a given switch (defaults to the 1st switch, use the selector to change it).</li>
+                <li><code>findme</code> and <code>findme-wifi</code> - turns the LED ON when all relays are OFF. This is meant to locate the device at night.</li>
+                <li><code>relays</code> and <code>relays-wifi</code> - turn the LED ON whenever any switch is ON, and OFF otherwise.</li>
+                <li><code>on</code> and <code>off</code> - LED is either permanently ON or OFF.</li>
+                <li><code>manual</code> - LED can be turned ON or OFF only through the API. For example, MQTT will subscribe to the "&lt;base_topic&gt;/led/0/set". Publishing "on", "off" or "toggle" to that topic will change the LED status accordingly.</li>
+            </ul>
+
+            </details>
+
+            <fieldset>
+                <div id="leds" class="settings-group"></div>
+                <button type="button" class="pure-button button-add-settings-group" data-settings-group="leds">Add LED</button>
+            </fieldset>
+        </div>
+    </div>
+</form>

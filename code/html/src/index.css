@@ -1,0 +1,516 @@
+/* -----------------------------------------------------------------------------
+    General
+   -------------------------------------------------------------------------- */
+
+#layout.initial {
+    padding-left: 0;
+}
+
+#layout.initial .content {
+    margin: 0 auto;
+}
+
+#layout.initial .menu-link,
+#layout.initial #menu {
+    display: none;
+}
+
+#layout.initial .button-setup-password {
+    display: inline-block;
+}
+
+#layout .button-setup-password {
+    display: none;
+}
+
+#layout.initial .setup-password-initial {
+    display: block;
+}
+
+#layout .setup-password-initial {
+    display: none;
+}
+
+#menu .pure-menu-item.pure-menu-item:first-child {
+    font-size: 100%;
+    font-weight: 250;
+    text-transform: uppercase;
+    background: #333;
+}
+
+#menu .pure-menu-item.pure-menu-selected.pure-menu-item:first-child {
+    background: #1f8dd6;
+}
+
+#menu .pure-menu-selected a {
+    transition: all ease 0.6s;
+}
+
+.pure-g {
+    margin-bottom: 0;
+}
+
+.pure-form legend {
+    font-weight: bold;
+    letter-spacing: 0;
+    margin: 10px 0 1em 0;
+}
+
+.pure-form .pure-g > label {
+    margin: .4em 0 .2em;
+}
+
+.pure-form input {
+    margin-bottom: 10px;
+}
+
+.pure-form input[type=text][disabled] {
+    color: #777777;
+}
+
+@media screen and (max-width: 32em) {
+    .header > h1 {
+        line-height: 100%;
+        font-size: 2em;
+    }
+}
+
+.header strong {
+    font-weight: bold;
+}
+
+h2 {
+    font-size: 1em;
+}
+
+.panel  {
+    display: none;
+}
+
+.block {
+    display: block;
+}
+
+.page {
+    margin-top: 10px;
+}
+
+.pure-form-aligned
+.pure-control-group
+label {
+    text-align: left;
+}
+
+.pure-form-message,
+.pure-form-message-inline {
+    color: #9e9e9e;
+    font-size: 80%;
+}
+
+.pure-form-message a,
+.pure-form-message-inline a {
+    color:inherit;
+}
+
+.module {
+    display: none;
+}
+
+.maybe-hidden {
+    display: none;
+}
+
+input[name=upgrade] {
+    display: none;
+}
+
+select {
+    margin-bottom: 10px;
+    width: 100%;
+}
+
+select[multiple] {
+    overflow-y: auto;
+    resize: vertical;
+}
+
+summary {
+    font-weight: bold;
+}
+
+input.center {
+    margin-bottom: 0;
+}
+
+div.center {
+    margin: .5em 0 1em;
+}
+
+span.hidden {
+    content-visibility: hidden;
+}
+
+span.visible {
+    content-visibility: visible;
+}
+
+.webmode {
+    display: none;
+}
+
+#layout .content {
+    margin: 0;
+}
+
+.state {
+    border-top: 1px solid #eee;
+    margin-top: 20px;
+    padding-top: 30px;
+    font-size: 80%;
+    line-height: 28px;
+}
+
+.state label {
+    width: 33%;
+}
+
+.state span {
+    font-weight: bold;
+    display: block;
+}
+
+.right {
+    text-align: right;
+}
+
+.center {
+    text-align: center;
+}
+
+/* -----------------------------------------------------------------------------
+    Buttons
+   -------------------------------------------------------------------------- */
+
+.pure-button {
+    border-radius: 4px;
+    color: white;
+    letter-spacing: 0;
+    margin-bottom: 10px;
+    text-shadow: 0 1px 1px rgba(0, 0, 0, 0.2);
+    padding: 8px 8px;
+}
+
+.main-buttons {
+    margin: 20px auto;
+    text-align: center;
+}
+.main-buttons button {
+    width: 100px;
+}
+
+.button-clear-counts,
+.button-clear-filters,
+.button-clear-messages,
+.button-dbg-clear,
+.button-del-settings-group,
+.button-ha-disabled,
+.button-lightfox-clear,
+.button-reboot,
+.button-reconnect,
+.button-rfb-forget,
+.button-settings-factory,
+.button-settings-password,
+.button-setup-password.button-setup-lenient,
+.button-upgrade {
+    background: rgb(192, 0, 0); /* redish */
+}
+
+.button-add-settings-group,
+.button-apikey,
+.button-cmd,
+.button-emon-expected-calculate,
+.button-garland-set-default,
+.button-ha-enabled,
+.button-lightfox-learn,
+.button-rfb-learn,
+.button-settings-backup,
+.button-settings-restore,
+.button-setup-password,
+.button-upgrade-browse {
+    background: rgb(0, 192, 0); /* green */
+}
+
+.button-save {
+    --save-background: grey;
+    background: var(--save-background);
+    transition: background-color ease-in-out 0.4s;
+}
+
+.button-wifi-scan,
+.button-more-parent,
+.button-simple-action,
+.button-rfb-save {
+    background: rgb(255, 128, 0); /* orange */
+}
+
+.button-curtain-open,
+.button-curtain-pause,
+.button-curtain-close,
+.button-emon-expected,
+.button-emon-expected-apply,
+.button-generate-password {
+    background: rgb(66, 184, 221); /* blue */
+}
+
+.button-upgrade-browse,
+.button-clear-filters,
+.button-clear-messages,
+.button-clear-counts,
+.button-ha-add,
+.button-apikey,
+.button-upgrade {
+    margin-left: 5px;
+}
+
+.button-thermostat-reset-counters {
+    background: rgb(204, 139, 41);
+}
+
+/* -----------------------------------------------------------------------------
+    Sliders
+   -------------------------------------------------------------------------- */
+
+input.slider {
+    margin-top: 10px;
+}
+
+span.slider {
+    font-size: 70%;
+    letter-spacing: 0;
+    margin-left: 10px;
+    margin-top: 7px;
+}
+
+/* -----------------------------------------------------------------------------
+    Checkboxes w/ custom toggle-switch appearance
+    Based on https://gist.github.com/yairEO/f5d36e4c038f986a3f5ddf18b6ca4266
+    Adjusted to allow for 'content' inside of '::before' and small attr tweaks
+   -------------------------------------------------------------------------- */
+
+input.checkbox-toggle {
+    --toggle-text-color: white;
+    --toggle-border-radius: 100px;
+    --toggle-handle-size: .6em;
+    --toggle-elem-size: 2em;
+    --toggle-bg-size: 3em;
+    --toggle-handle-gap: .2em;
+    --toggle-color-off: #c00000; /* redish */
+    --toggle-color-on: #00c000; /* greenish */
+    --toggle-fg: var(--toggle-color-off);
+    --toggle-bg: color-mix(in srgb, var(--toggle-fg) 20%, transparent);
+
+    appearance: none;
+    box-sizing: content-box;
+    display: inline-flex;
+    justify-content: center;
+    padding-inline: 0 var(--toggle-bg-size);
+    border: none;
+    height: auto;
+    width: auto;
+    margin: 0;
+    border-radius: var(--toggle-border-radius);
+    background: var(--toggle-bg);
+    transition: var(--toggle-duration, .2s) cubic-bezier(.65, 0, .5, 1);
+    user-select: none;
+    outline: thin solid color-mix(in srgb, var(--toggle-bg) 25%, rgba(0,0,0,.2));
+    cursor: pointer;
+}
+
+/* only ::before is used for content, adjust padding to move the toggle to a specific position */
+input.checkbox-toggle:checked {
+    padding-inline: var(--toggle-bg-size) 0;
+    --toggle-fg: var(--toggle-color-on);
+}
+
+input.checkbox-toggle::before {
+    text-align: center;
+    color: var(--toggle-text-color);
+    width: var(--toggle-elem-size);
+}
+
+/* checkboxes are usually allow DISABLING and ENABLING settings */
+input.checkbox-toggle::before {
+    content: "NO";
+}
+
+input.checkbox-toggle:checked::before {
+    content: "YES";
+}
+
+input.checkbox-toggle::before {
+    padding: var(--toggle-handle-size);
+    margin: var(--toggle-handle-gap);
+    background: var(--toggle-fg);
+    border-radius: var(--toggle-border-radius);
+    transition: inherit;
+}
+
+input.checkbox-toggle + .pure-form-message {
+    margin-top: .625em;
+}
+
+input[disabled].checkbox-toggle {
+    filter: grayscale(0.8);
+}
+
+/* -----------------------------------------------------------------------------
+    Loading
+   -------------------------------------------------------------------------- */
+
+.loading {
+    display: none;
+    height: 1em;
+    margin: 8px 0 0 10px;
+    width: 1em;
+    animation: 3s linear infinite reverse loading;
+}
+
+@keyframes loading {
+    to {
+        rotate: 0deg;
+    }
+    from {
+        rotate: 360deg;
+    }
+}
+
+/* -----------------------------------------------------------------------------
+    Menu
+   -------------------------------------------------------------------------- */
+
+#menu .small {
+    font-size: 60%;
+    padding-left: 9px;
+}
+
+#menu div.footer {
+    color: #999;
+    font-size: 80%;
+    padding: 10px;
+}
+#menu div.footer a {
+    padding: 0;
+    text-decoration: none;
+}
+
+/* -----------------------------------------------------------------------------
+    Admin panel
+   -------------------------------------------------------------------------- */
+
+#upgrade-progress {
+    display: none;
+    height: 20px;
+    margin-top: 10px;
+    width: 100%;
+}
+
+#error-notification,
+#uploader,
+#downloader {
+    display: none;
+}
+
+#error-notification.show-error {
+    display: inherit;
+    white-space: pre-wrap;
+}
+
+/* -----------------------------------------------------------------------------
+    Wifi panel
+   -------------------------------------------------------------------------- */
+
+#networks .pure-g,
+#schedules .pure-g {
+    border-bottom: 1px solid #eee;
+    margin-bottom: 10px;
+    padding: 10px 0 10px 0;
+}
+
+.schedule {
+    margin-bottom: 10px;
+}
+
+.schedule .button-del-settings-group {
+    margin-left: auto;
+}
+
+#networks .more {
+    display: none;
+}
+
+#haConfig,
+#scanResult {
+    margin-top: 10px;
+    display: none;
+    padding: 10px;
+}
+
+/* -----------------------------------------------------------------------------
+    Password input controls
+   -------------------------------------------------------------------------- */
+.password-reveal {
+    font-family: EmojiSymbols,Segoe UI Symbol;
+    background: rgba(0,0,0,0);
+    position: absolute;
+    display: inline-block;
+    float: right;
+    z-index: 50;
+    margin-top: 0.3em;
+    margin-left: -1.4em;
+    vertical-align: middle;
+    font-size: 1.2em;
+}
+
+.pure-form input[type="password"]:has(+ .password-reveal),
+.pure-form input[type="text"]:has(+ .password-reveal) {
+    display: inline-block;
+}
+
+.password-reveal::before {
+    content: "👁";
+}
+
+input[type="password"] + .password-reveal {
+    color: rgba(205, 205, 205, 0.3);
+}
+
+input[type="text"] + .password-reveal {
+    color: rgba(66, 184, 221, 0.8);
+}
+
+.no-select {
+    -webkit-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    user-select: none;
+}
+
+input::-ms-clear,
+input::-ms-reveal {
+    display: none;
+}
+
+/* css minifier must not combine these.
+ * style will not apply otherwise */
+input::-ms-input-placeholder {
+    color: #ccd;
+}
+
+input::placeholder {
+    color: #ccc;
+}
+
+#error-notification {
+    width: 100%;
+    box-shadow: 0 1px 2px 1px rgb(192 0 0 / 25%)
+}

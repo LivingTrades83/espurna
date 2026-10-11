@@ -7,30 +7,38 @@ Inspired by https://github.com/Vasil-Pahomov/ArWs2812 (currently https://github.
 
 #pragma once
 
-#if GARLAND_SUPPORT
+class Color {
+public:
+    byte r = 0;
+    byte g = 0;
+    byte b = 0;
 
-#include <Arduino.h>
-#include <string>
+    Color() = default;
+    Color(const Color&) = default;
+    Color(Color&&) = default;
 
-struct Color
-{
-    byte r;
-    byte g;
-    byte b;
+    Color& operator=(const Color&) = default;
+    Color& operator=(Color&&) = default;
 
-    inline Color() : r(0), g(0), b(0) {}
+    bool operator==(const Color& other) const {
+        return (r == other.r) && (g == other.g) && (b == other.b);
+    }
 
     // allow construction from R, G, B
-    inline Color(uint8_t ir, uint8_t ig, uint8_t ib)
+    Color(uint8_t ir, uint8_t ig, uint8_t ib)
         : r(ir), g(ig), b(ib) {
     }
 
     // allow construction from 32-bit (really 24-bit) bit 0xRRGGBB color code
-    inline Color(uint32_t colorcode)
+    Color(uint32_t colorcode)
         : r((colorcode >> 16) & 0xFF), g((colorcode >> 8) & 0xFF), b((colorcode >> 0) & 0xFF) {
     }
 
-    //interpolates between this color and provided. 
+    static Color empty() {
+        return Color();
+    }
+
+    //interpolates between this color and provided.
     //x is from 0 to 1, 0 gives this color, 1 gives provided color, values between give interpolation
     Color interpolate(Color color, float x) const {
         int r0 = x * (color.r - r) + r;
@@ -61,7 +69,7 @@ struct Color
         if (g>=dg) { g=g-dg; } else { g=0; }
         if (b>=db) { b=b-db; } else { b=0; }
         return *this;
-    }  
+    }
 
     Color max_bright() {
         if (r==255 || g==255 || b==255)
@@ -88,23 +96,15 @@ struct Color
         return abs(r - c.r) + abs(g - c.g) + abs(b - c.b);
     }
 
-    bool empty() const {
+    bool is_empty() const {
         return r == 0 && g == 0 && b == 0;
-    }
-
-    void println() const {
-        Serial.print(("r="));Serial.print(r);Serial.print((" "));
-        Serial.print(("g="));Serial.print(g);Serial.print( (" "));
-        Serial.print(("b="));Serial.println(b);
     }
 
     String to_str() {
         char buf[20];
-        sprintf(buf, "r=%hhu, g=%hhu, b=%hhu", r, g, b);
+        snprintf_P(buf, sizeof(buf),
+            PSTR("r=%hhu, g=%hhu, b=%hhu"),
+            r, g, b);
         return buf;
     }
-
-    friend bool operator== (const Color &c1, const Color &c2);
 };
-
-#endif // GARLAND_SUPPORT

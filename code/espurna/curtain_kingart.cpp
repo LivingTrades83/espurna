@@ -10,26 +10,16 @@ Copyright (C) 2020 - Eric Chauvet
 
 */
 
-#include "curtain_kingart.h"
+#include "espurna.h"
 
 #if KINGART_CURTAIN_SUPPORT
 
+#include "curtain_kingart.h"
 #include "mqtt.h"
 #include "ntp.h"
 #include "ntp_timelib.h"
 #include "settings.h"
 #include "ws.h"
-
-#ifndef KINGART_CURTAIN_PORT
-#define KINGART_CURTAIN_PORT         Serial      // Hardware serial port by default
-#endif
-
-#ifndef KINGART_CURTAIN_BUFFER_SIZE
-#define KINGART_CURTAIN_BUFFER_SIZE  100         // Local UART buffer size
-#endif
-
-#define KINGART_CURTAIN_TERMINATION  '\e'        // Termination character after each message
-#define KINGART_CURTAIN_BAUDRATE     19200       // Serial speed is fixed for the device
 
 // --> Let see after if we define a curtain generic switch, use these for now
 #define CURTAIN_BUTTON_UNKNOWN       -1
@@ -45,7 +35,11 @@ Copyright (C) 2020 - Eric Chauvet
 #define CURTAIN_POSITION_UNKNOWN     -1
 // <--
 
+namespace {
+
 #define KINGART_DEBUG_MSG_P(...) do { if (_curtain_debug_flag) { DEBUG_MSG_P(__VA_ARGS__); } } while(0)
+
+Stream* _curtain_port { nullptr };
 
 char _KACurtainBuffer[KINGART_CURTAIN_BUFFER_SIZE];
 bool _KACurtainNewData = false;
@@ -65,23 +59,23 @@ bool _curtain_initial_position_set  = false; //Flag to detect if we manage to se
 // Calculated behaviour depending on KA switch, MQTT and UI actions
 bool _curtain_moving                = true;
 
-//Enable more traces, true as a default and stopped when curtain is setup.
+// Enable more traces when setting up, but disabled afterwards
 bool _curtain_debug_flag = true;
 
 #if WEB_SUPPORT
-bool _curtain_report_ws = true; //This will init curtain control and flag the web ui update
-#endif // WEB_SUPPORT
+bool _curtain_report_ws = true;
+#endif
 
 
 //------------------------------------------------------------------------------
 void curtainUpdateUI() {
 #if WEB_SUPPORT
     _curtain_report_ws = true;
-#endif // WEB_SUPPORT
+#endif
 }
 
 //------------------------------------------------------------------------------
-int setButtonFromSwitchText(String & text) {
+int setButtonFromSwitchText(const String& text) {
     if(text == "on")
         return CURTAIN_BUTTON_OPEN;
     else if(text == "off")
@@ -116,9 +110,9 @@ void _KASetMoving() {
 //------------------------------------------------------------------------------
 //Send a buffer to serial
 void _KACurtainSend(const char * tx_buffer) {
-    KINGART_CURTAIN_PORT.print(tx_buffer);
-    KINGART_CURTAIN_PORT.print(KINGART_CURTAIN_TERMINATION);
-    KINGART_CURTAIN_PORT.flush();
+    _curtain_port->print(tx_buffer);
+    _curtain_port->print(KINGART_CURTAIN_TERMINATION);
+    _curtain_port->flush();
     KINGART_DEBUG_MSG_P(PSTR("[KA] UART OUT %s\n"), tx_buffer);
 }
 
@@ -181,7 +175,7 @@ void _KAStopMoving() {
             }
         }
         _curtain_initial_position_set = true;
-        _curtain_debug_flag = false; //Disable debug - user has could ask for it
+        _curtain_debug_flag = false;
     } else if(_curtain_position_set != CURTAIN_POSITION_UNKNOWN && _curtain_position_set != getSetting("curtainBootPos", _curtain_position_set)) {
            setSetting("curtainBootPos", _curtain_last_position); //Remeber last position in case of power loss
     }
@@ -191,8 +185,8 @@ void _KAStopMoving() {
 //Receive a buffer from serial
 bool _KACurtainReceiveUART() {
     static unsigned char ndx = 0;
-    while (KINGART_CURTAIN_PORT.available() > 0 && !_KACurtainNewData) {
-        char rc = KINGART_CURTAIN_PORT.read();
+    while (_curtain_port->available() > 0 && !_KACurtainNewData) {
+        char rc = _curtain_port->read();
         if (rc != KINGART_CURTAIN_TERMINATION) {
             _KACurtainBuffer[ndx] = rc;
             if (ndx < KINGART_CURTAIN_BUFFER_SIZE - 1) ndx++;
@@ -264,15 +258,8 @@ void _KACurtainResult() {
             ( _curtain_last_button == CURTAIN_BUTTON_CLOSE && _curtain_last_position == 100 ) ||
             _curtain_last_button == CURTAIN_BUTTON_PAUSE) { //The curtain is max opened, closed or pause
             _KAStopMoving();
-        } else { //Else it is probably moving
+        } else { //Else it is probably moving. Ignore position, wait for switch instead
             _KASetMoving();
-            /*
-                (*1) ATTENTION THERE :
-                Send immediatly a AT+START - we need to purge the first response.
-                It will return us the right direction of the switch but the position
-                we set instead of the real on. We take care of the switch response but
-                we ignore the position.
-            */
             _KACurtainSend("AT+START");
             _curtain_ignore_next_position = true;
         }
@@ -327,10 +314,9 @@ void _KACurtainResult() {
     if(_curtain_position != CURTAIN_POSITION_UNKNOWN && _curtain_last_position != _curtain_position) {
         _curtain_last_position = _curtain_position;
 
-        #if MQTT_SUPPORT
-        const String pos = String(_curtain_last_position);
-        mqttSend(MQTT_TOPIC_CURTAIN, pos.c_str());
-        #endif // MQTT_SUPPORT
+#if MQTT_SUPPORT
+        mqttSend(MQTT_TOPIC_CURTAIN, String(_curtain_last_position, 10).c_str());
+#endif
     }
 
     //Reset last button to make the algorithm work and set last button state
@@ -344,7 +330,7 @@ void _KACurtainResult() {
     if (buffer.indexOf("enterESPTOUCH") > 0) {
         wifiStartAp();
     } else if (buffer.indexOf("exitESPTOUCH") > 0) {
-        deferredReset(100, CustomResetReason::Hardware);
+        prepareReset(CustomResetReason::Hardware);
     } else { //In any other case, update as it could be a move action
         curtainUpdateUI();
     }
@@ -357,21 +343,21 @@ void _KACurtainResult() {
 #if MQTT_SUPPORT
 
 //------------------------------------------------------------------------------
-void _curtainMQTTCallback(unsigned int type, const char * topic, char * payload) {
+void _curtainMQTTCallback(unsigned int type, espurna::StringView topic, espurna::StringView payload) {
     if (type == MQTT_CONNECT_EVENT) {
         mqttSubscribe(MQTT_TOPIC_CURTAIN);
     } else if (type == MQTT_MESSAGE_EVENT) {
         // Match topic
-        const String t = mqttMagnitude(const_cast<char*>(topic));
+        const auto t = mqttMagnitude(topic);
         if (t.equals(MQTT_TOPIC_CURTAIN)) {
-            if (strcmp(payload, "pause") == 0) {
+            if (payload == "pause") {
                 _KACurtainSet(CURTAIN_BUTTON_PAUSE);
-            } else  if (strcmp(payload, "on") == 0) {
+            } else if (payload == "on") {
                 _KACurtainSet(CURTAIN_BUTTON_OPEN);
-            } else  if (strcmp(payload, "off") == 0) {
+            } else if (payload == "off") {
                 _KACurtainSet(CURTAIN_BUTTON_CLOSE);
             } else {
-                _curtain_position_set = String(payload).toInt();
+                _curtain_position_set = payload.toString().toInt();
                 _KACurtainSet(CURTAIN_BUTTON_UNKNOWN, _curtain_position_set);
             }
         }
@@ -386,17 +372,17 @@ void _curtainMQTTCallback(unsigned int type, const char * topic, char * payload)
 
 #if WEB_SUPPORT
 
+STRING_VIEW_INLINE(CurtainPrefix, "curtain");
+
 //------------------------------------------------------------------------------
 void _curtainWebSocketOnConnected(JsonObject& root) {
     root["curtainType"] = getSetting("curtainType", "0");
     root["curtainBoot"] = getSetting("curtainBoot", "0");
-    root["curtainConfig"] = 1;
 }
 
 //------------------------------------------------------------------------------
-bool _curtainWebSocketOnKeyCheck(const char * key, JsonVariant& value) {
-    if (strncmp(key, "curtain", strlen("curtain")) == 0) return true;
-    return false;
+bool _curtainWebSocketOnKeyCheck(espurna::StringView key, const JsonVariant& value) {
+    return key.startsWith(CurtainPrefix);
 }
 
 //------------------------------------------------------------------------------
@@ -410,11 +396,6 @@ void _curtainWebSocketUpdate(JsonObject& root) {
     state["button"] = _curtain_last_button;
     state["moving"] = _curtain_moving;
     state["type"] = getSetting("curtainType", "0");
-}
-
-//------------------------------------------------------------------------------
-void _curtainWebSocketStatus(JsonObject& root) {
-    _curtainWebSocketUpdate(root);
 }
 
 //------------------------------------------------------------------------------
@@ -432,7 +413,7 @@ void _curtainWebSocketOnAction(uint32_t client_id, const char * action, JsonObje
 }
 
 void _curtainWebSocketOnVisible(JsonObject& root) {
-    root["curtainVisible"] = 1;
+    wsPayloadModule(root, CurtainPrefix);
 }
 
 #endif //WEB_SUPPORT
@@ -442,7 +423,7 @@ void _curtainWebSocketOnVisible(JsonObject& root) {
 // -----------------------------------------------------------------------------
 
 //------------------------------------------------------------------------------
-void _KACurtainLoop() {
+static void _KACurtainLoop() {
 
     if(_KACurtainReceiveUART()) {
         _KACurtainResult();
@@ -456,22 +437,31 @@ void _KACurtainLoop() {
     }
 
 #if WEB_SUPPORT
-    if (_curtain_report_ws) { //Launch a websocket update
+    if (_curtain_report_ws) {
         wsPost(_curtainWebSocketUpdate);
         _curtain_report_ws = false;
     }
  #endif
 }
 
-// -----------------------------------------------------------------------------
-// Public
-// -----------------------------------------------------------------------------
+void _curtainUpdate(size_t id, int value) {
+    if (id == 0) {
+        _KACurtainSet(CURTAIN_BUTTON_UNKNOWN, std::clamp(value, 0, 100));
+    }
+}
+
+size_t _curtainCount() {
+    return 1;
+}
 
 //------------------------------------------------------------------------------
-void kingartCurtainSetup() {
+void _kingartCurtainSetup() {
+    const auto port = uartPort(KINGART_CURTAIN_PORT - 1);
+    if (!port || (!port->tx || !port->rx)) {
+        return;
+    }
 
-    // Init port to receive and send messages
-    KINGART_CURTAIN_PORT.begin(KINGART_CURTAIN_BAUDRATE);
+    _curtain_port = port->stream;
 
 #if MQTT_SUPPORT
     // Register MQTT callback only when supported
@@ -490,17 +480,24 @@ void kingartCurtainSetup() {
 
     // Register loop to poll the UART for new messages
     espurnaRegisterLoop(_KACurtainLoop);
-
 }
 
-//------------------------------------------------------------------------------
-void curtainSetPosition(unsigned char id, long value) {
-    if (id > 1) return;
-    _KACurtainSet(CURTAIN_BUTTON_UNKNOWN, constrain(value, 0, 100));
+} // namespace
+
+// -----------------------------------------------------------------------------
+// Public
+// -----------------------------------------------------------------------------
+
+void curtainSetup() {
+    _kingartCurtainSetup();
 }
 
-unsigned char curtainCount() {
-    return 1;
+size_t curtainCount() {
+    return _curtainCount();
+}
+
+void curtainUpdate(unsigned char id, int value) {
+    _curtainUpdate(id, value);
 }
 
 #endif // KINGART_CURTAIN_SUPPORT

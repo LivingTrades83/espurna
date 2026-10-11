@@ -9,20 +9,45 @@
 
 # Run this script every time building an env BEFORE platform-specific code is loaded
 
-from __future__ import print_function
-
-Import("env")
-
+import logging
 import os
+import shutil
 import sys
 
+from SCons.Script import Delete, Move, Import, ARGUMENTS
 
-from SCons.Script import ARGUMENTS
+from platformio.package.manager.library import LibraryPackageManager
+from platformio.package.meta import PackageSpec
 
-from espurna_utils.release import merge_cpp
+from espurna_utils import (
+    app_add_builder_single_source,
+    app_add_target_build_re2c,
+    check_env,
+)
 
 
-CI = "true" == os.environ.get("CI")
+Import("env")
+env = globals()["env"]
+
+# handle `-t build-and-copy` parameters
+for name in [
+    # what is the name suffix of the .bin
+    "ESPURNA_BUILD_NAME",
+    # where to copy the resulting .bin
+    "ESPURNA_BUILD_DESTINATION",
+    # set the full string for the build, no need to change individual parts
+    "ESPURNA_BUILD_FULL_VERSION",
+    # **or**, replace parts of the version string that would've been auto-detected
+    "ESPURNA_BUILD_VERSION",
+    "ESPURNA_BUILD_REVISION",
+    "ESPURNA_BUILD_VERSION_SUFFIX",
+]:
+    value = os.environ.get(name)
+    if value:
+        env.Append(**{name: value})
+
+
+CI = check_env("CI", "false")
 PIO_PLATFORM = env.PioPlatform()
 CONFIG = env.GetProjectConfig()
 VERBOSE = "1" == ARGUMENTS.get("PIOVERBOSE", "0")
@@ -37,54 +62,52 @@ def log(message, verbose=False, file=sys.stderr):
         print(message, file=file)
 
 
-# Most portable way, without depending on platformio internals
-def subprocess_libdeps(lib_deps, storage=None, verbose=False):
-    import subprocess
-
-    args = [env.subst("$PYTHONEXE"), "-mplatformio", "lib"]
-    if not storage:
-        args.append("-g")
-    else:
-        args.extend(["-d", storage])
-    args.append("install")
-    if not verbose:
-        args.append("-s")
-
-    args.extend(lib_deps)
-
-    subprocess.check_call(args)
+def get_shared_libdeps(config, section="common", name="shared_lib_deps"):
+    raw = config.getraw(section, name)
+    return config.parse_multi_values(raw)
 
 
-# Avoid spawning pio lib every time, hook into the LibraryManager API (sort-of internal)
-def library_manager_libdeps(lib_deps, storage=None):
-    from platformio.managers.lib import LibraryManager
-    from platformio.project.helpers import get_project_global_lib_dir
-
-    if not storage:
-        manager = LibraryManager(get_project_global_lib_dir())
-    else:
-        manager = LibraryManager(storage)
-
-    for lib in lib_deps:
-        if manager.get_package_dir(*manager.parse_pkg_uri(lib)):
-            continue
-        log("installing: {}".format(lib))
-        manager.install(lib)
+def get_shared_libdir(config, section="common", name="shared_lib_dir"):
+    return config.getraw(section, name)
 
 
-def get_shared_libdeps_dir(section, name):
+def migrate_libraries(storage):
+    target = env.Dir(f"$PROJECT_DIR/{storage}")
+    if target.exists():
+        return
 
-    if not CONFIG.has_option(section, name):
-        raise ExtraScriptError("{}.{} is required to be set".format(section, name))
+    old_lib_deps = env.Dir("$PROJECT_LIBDEPS_DIR/$PIOENV")
+    if not old_lib_deps.exists() or old_lib_deps.islink():
+        return
 
-    opt = CONFIG.get(section, name)
+    env.Execute(env.VerboseAction(Move(target, old_lib_deps), "Migrating $TARGET"))
 
-    if not opt in env.GetProjectOption("lib_extra_dirs"):
-        raise ExtraScriptError(
-            "lib_extra_dirs must contain {}.{}".format(section, name)
-        )
 
-    return os.path.join(env["PROJECT_DIR"], opt)
+def install_libraries(specs, storage, verbose=False):
+    lm = LibraryPackageManager(storage)
+    lm.set_log_level(logging.DEBUG if verbose else logging.INFO)
+
+    # as described in platformio .ini
+    known = set()
+
+    for spec in specs:
+        pkg = lm.get_package(spec)
+        if not pkg:
+            pkg = lm.install(spec, skip_dependencies=True)
+
+        if pkg:
+            known.add(pkg)
+
+    lm.memcache_reset()
+
+    # actually installed packages (library storage)
+    installed = set(lm.get_installed())
+
+    for pkg in installed.difference(known):
+        try:
+            lm.uninstall(pkg, skip_dependencies=True)
+        except:
+            pass
 
 
 def ensure_platform_updated():
@@ -100,26 +123,21 @@ def ensure_platform_updated():
 # using env instead of ini to avoid platformio ini changing hash on every change
 env.Append(
     ESPURNA_BOARD=os.environ.get("ESPURNA_BOARD", ""),
-    ESPURNA_AUTH=os.environ.get("ESPURNA_AUTH", ""),
     ESPURNA_FLAGS=os.environ.get("ESPURNA_FLAGS", ""),
 )
 
 ESPURNA_OTA_PORT = os.environ.get("ESPURNA_IP")
 if ESPURNA_OTA_PORT:
-    env.Replace(UPLOAD_PROTOCOL="espota")
-    env.Replace(UPLOAD_PORT=ESPURNA_OTA_PORT)
-    env.Replace(UPLOAD_FLAGS="--auth=$ESPURNA_AUTH")
+    env.Replace(
+        ESPURNA_AUTH=env.Literal(os.environ.get("ESPURNA_AUTH", "")),
+    )
+    env.Replace(
+        UPLOAD_PROTOCOL="espota",
+        UPLOAD_PORT=ESPURNA_OTA_PORT,
+        UPLOAD_FLAGS="--auth=$ESPURNA_AUTH",
+    )
 else:
     env.Replace(UPLOAD_PROTOCOL="esptool")
-
-# handle `-t release` parameters
-if CI:
-    env.Append(
-        ESPURNA_RELEASE_REVISION=os.environ.get("ESPURNA_RELEASE_REVISION", ""),
-        ESPURNA_RELEASE_NAME=os.environ.get("ESPURNA_RELEASE_NAME", ""),
-        ESPURNA_RELEASE_VERSION=os.environ.get("ESPURNA_RELEASE_VERSION", ""),
-        ESPURNA_RELEASE_DESTINATION=os.environ.get("ESPURNA_RELEASE_DESTINATION", ""),
-    )
 
 # updates arduino core git to the latest master commit
 if CI:
@@ -129,16 +147,13 @@ if CI:
             ensure_platform_updated()
             break
 
-# to speed-up build process, install libraries in either global or local shared storage
-if os.environ.get("ESPURNA_PIO_SHARED_LIBRARIES"):
-    if CI:
-        storage = None
-        log("using global library storage")
-    else:
-        storage = get_shared_libdeps_dir("common", "shared_libdeps_dir")
-        log("using shared library storage: {}".format(storage))
+# to speed-up build process, install libraries in a way they are shared between our envs
+# b/c lib_extra_dirs = ... was deprecated and global libs are not an option, just re-use the local custom lib storage
+# (...while it still works :/...)
+SHARED_LIBDIR = get_shared_libdir(CONFIG)
+migrate_libraries(SHARED_LIBDIR)
+install_libraries(get_shared_libdeps(CONFIG), SHARED_LIBDIR, verbose=VERBOSE)
 
-    subprocess_libdeps(env.GetProjectOption("lib_deps"), storage, verbose=VERBOSE)
 
 # tweak build system to ignore espurna.ino, but include user code
 # ref: platformio-core/platformio/tools/piomisc.py::ConvertInoToCpp()
@@ -151,28 +166,8 @@ if len(ino) == 1 and ino[0].name == "espurna.ino":
     env.AddMethod(ConvertInoToCpp)
 
 # merge every .cpp into a single file and **only** build that single file
-if "1" == os.environ.get("ESPURNA_BUILD_SINGLE_SOURCE", "0"):
-    cpp_files = []
-    for root, dirs, filenames in os.walk("espurna"):
-        for name in filenames:
-            if not name.endswith(".cpp"):
-                continue
+if check_env("ESPURNA_BUILD_SINGLE_SOURCE", "0"):
+    app_add_builder_single_source(env)
 
-            abspath = os.path.join(os.path.abspath(root), name)
-            env.AddBuildMiddleware(lambda node: None, abspath)
-
-            relpath = os.path.relpath(abspath, "espurna")
-            cpp_files.append(relpath)
-    merge_cpp(cpp_files, "espurna/espurna_single_source.cpp")
-
-# make sure to register as a valid command. however, it is always called right here
-# (--list-targets is a kind-of inefficient for finding this, though, since it *will* install libs into .pio/ anyways...)
-def install_libs_dummy(target, source, env):
-    pass
-env.AddCustomTarget("install-libs", None, install_libs_dummy)
-
-from SCons.Script import COMMAND_LINE_TARGETS
-if "install-libs" in COMMAND_LINE_TARGETS:
-    storage = get_shared_libdeps_dir("common", "shared_libdeps_dir")
-    subprocess_libdeps(env.GetProjectOption("lib_deps"), storage, verbose=VERBOSE)
-    sys.exit(0)
+# handle explicit targets that are used to build .re files, and before falling into the next sconsfile
+app_add_target_build_re2c(env)

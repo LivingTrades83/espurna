@@ -7,160 +7,274 @@ Copyright (C) 2019-2021 by Maxim Prokhorov <prokhorov dot max at outlook dot com
 
 */
 
-#include "button.h"
+#include "espurna.h"
 
 #if BUTTON_SUPPORT
+
+#include "button.h"
+#include "compat.h"
+#include "fan.h"
+#include "gpio.h"
+#include "light.h"
+#include "lightfox.h"
+#include "mqtt.h"
+#include "relay.h"
+#include "system.h"
+#include "thermostat.h"
+
+#if WEB_SUPPORT
+#include "ws.h"
+#endif
+
+#include "libs/EphemeralPrint.h"
+#include "libs/PrintString.h"
+
+#include "mcp23s08_pin.h"
 
 #include <bitset>
 #include <memory>
 #include <vector>
 
-#include "compat.h"
-#include "fan.h"
-#include "gpio.h"
-#include "light.h"
-#include "mqtt.h"
-#include "relay.h"
-#include "system.h"
-#include "ws.h"
-
-#include "libs/BasePin.h"
-#include "libs/DebounceEvent.h"
-#include "gpio_pin.h"
-#include "mcp23s08_pin.h"
-
-#include "button_config.h"
-
 // -----------------------------------------------------------------------------
+
+static constexpr auto ButtonsPresetMax [[gnu::unused]] = size_t(8);
+
+enum class ButtonProvider {
+    None,
+    Dummy,
+    Gpio,
+    Analog,
+    Lightfox,
+};
+
+struct ButtonActions {
+    ButtonAction pressed;
+    ButtonAction released;
+    ButtonAction click;
+    ButtonAction dblclick;
+    ButtonAction lngclick;
+    ButtonAction lnglngclick;
+    ButtonAction trplclick;
+};
+
+struct ButtonEventDelays {
+    unsigned long debounce;
+    unsigned long repeat;
+    unsigned long lngclick;
+    unsigned long lnglngclick;
+};
+
+namespace espurna {
+namespace button {
+namespace {
+
+using ButtonEventEmitterPtr = std::unique_ptr<debounce_event::EventEmitter>;
+
+struct Button {
+    Button() = delete;
+
+    Button(ButtonActions&& actions, ButtonEventDelays&& delays);
+    Button(BasePinPtr&& pin, const debounce_event::types::Config& config,
+        ButtonActions&& actions, ButtonEventDelays&& delays);
+
+    bool state();
+    ButtonEvent loop();
+
+    ButtonEventEmitterPtr event_emitter;
+
+    ButtonActions actions;
+    ButtonEventDelays event_delays;
+};
+
+namespace settings {
+namespace keys {
+
+PROGMEM_STRING(Gpio, "btnGpio");
+PROGMEM_STRING(GpioType, "btnGpioType");
+PROGMEM_STRING(Provider, "btnProv");
+PROGMEM_STRING(Mode, "btnMode");
+PROGMEM_STRING(DefaultValue, "btnDefVal");
+PROGMEM_STRING(PinMode, "btnPinMode");
+
+PROGMEM_STRING(Release, "btnRlse");
+PROGMEM_STRING(Press, "btnPress");
+PROGMEM_STRING(Click, "btnClick");
+PROGMEM_STRING(DoubleClick, "btnDclk");
+PROGMEM_STRING(TripleClick, "btnTclk");
+PROGMEM_STRING(LongClick, "btnLclk");
+PROGMEM_STRING(LongLongClick, "btnLLclk");
+
+PROGMEM_STRING(DebounceDelay, "btnDebDel");
+PROGMEM_STRING(LongClickDelay, "btnLclkDel");
+PROGMEM_STRING(LongLongClickDelay, "btnLLclkDel");
+PROGMEM_STRING(RepeatDelay, "btnRepDel");
+
+PROGMEM_STRING(Relay, "btnRelay");
+
+PROGMEM_STRING(MqttSendAll, "btnMqttSendAll");
+PROGMEM_STRING(MqttRetain, "btnMqttRetain");
+
+[[gnu::unused]] PROGMEM_STRING(AnalogLevel, "btnLevel");
+
+[[gnu::unused]] PROGMEM_STRING(TerminalCommand, "btnTermCmd");
+
+} // namespace keys
+
+namespace options {
+
+using espurna::settings::options::Enumeration;
+
+PROGMEM_STRING(Switch, "switch");
+PROGMEM_STRING(Pushbutton, "pushbutton");
+
+static constexpr std::array<Enumeration<debounce_event::types::Mode>, 2> DebounceEventMode PROGMEM {
+    {{debounce_event::types::Mode::Switch, Switch},
+     {debounce_event::types::Mode::Pushbutton, Pushbutton}}
+};
+
+PROGMEM_STRING(Low, "low");
+PROGMEM_STRING(High, "high");
+PROGMEM_STRING(Initial, "initial");
+
+static constexpr std::array<Enumeration<debounce_event::types::PinValue>, 3> DebounceEventPinValue PROGMEM {
+    {{debounce_event::types::PinValue::Low, Low},
+     {debounce_event::types::PinValue::High, High},
+     {debounce_event::types::PinValue::Initial, Initial}}
+};
+
+PROGMEM_STRING(Input, "default");
+PROGMEM_STRING(InputPullup, "pull-up");
+PROGMEM_STRING(InputPulldown, "pull-down");
+
+static constexpr std::array<Enumeration<debounce_event::types::PinMode>, 3> DebounceEventPinMode PROGMEM {
+    {{debounce_event::types::PinMode::Input, Input},
+     {debounce_event::types::PinMode::InputPullup, InputPullup},
+     {debounce_event::types::PinMode::InputPulldown, InputPulldown}}
+};
+
+PROGMEM_STRING(None, "none");
+PROGMEM_STRING(Dummy, "dummy");
+PROGMEM_STRING(Gpio, "gpio");
+PROGMEM_STRING(Analog, "analog");
+PROGMEM_STRING(Lightfox, "lightfox");
+
+static constexpr std::array<Enumeration<ButtonProvider>, 5> ButtonProviderOptions PROGMEM {
+    {{ButtonProvider::None, None},
+     {ButtonProvider::Dummy, Dummy},
+     {ButtonProvider::Gpio, Gpio},
+     {ButtonProvider::Analog, Analog},
+     {ButtonProvider::Lightfox, Lightfox}}
+};
+
+[[gnu::unused]] PROGMEM_STRING(Toggle, "relay-toggle");
+[[gnu::unused]] PROGMEM_STRING(On, "relay-on");
+[[gnu::unused]] PROGMEM_STRING(Off, "relay-off");
+
+PROGMEM_STRING(AccessPoint, "wifi-ap");
+PROGMEM_STRING(Reset, "reset");
+PROGMEM_STRING(FactoryReset, "factory");
+
+[[gnu::unused]] PROGMEM_STRING(BrightnessIncrease, "bri-inc");
+[[gnu::unused]] PROGMEM_STRING(BrightnessDecrease, "bri-dec");
+
+[[gnu::unused]] PROGMEM_STRING(DisplayOn, "display-on");
+
+PROGMEM_STRING(Custom, "custom");
+
+[[gnu::unused]] PROGMEM_STRING(FanLow, "fan-low");
+[[gnu::unused]] PROGMEM_STRING(FanMedium, "fan-medium");
+[[gnu::unused]] PROGMEM_STRING(FanHigh, "fan-high");
+
+PROGMEM_STRING(TerminalCommand, "term-cmd");
+
+static constexpr Enumeration<ButtonAction> ButtonActionOptions[] PROGMEM {
+    {ButtonAction::None, None},
+#if RELAY_SUPPORT
+    {ButtonAction::Toggle, Toggle},
+    {ButtonAction::On, On},
+    {ButtonAction::Off, Off},
+#endif
+    {ButtonAction::AccessPoint, AccessPoint},
+    {ButtonAction::Reset, Reset},
+    {ButtonAction::FactoryReset, FactoryReset},
+#if LIGHT_PROVIDER != LIGHT_PROVIDER_NONE
+    {ButtonAction::BrightnessIncrease, BrightnessIncrease},
+    {ButtonAction::BrightnessDecrease, BrightnessDecrease},
+#endif
+#if THERMOSTAT_DISPLAY_SUPPORT
+    {ButtonAction::DisplayOn, DisplayOn},
+#endif
+    {ButtonAction::Custom, Custom},
+#if FAN_SUPPORT
+    {ButtonAction::FanLow, FanLow},
+    {ButtonAction::FanMedium, FanMedium},
+    {ButtonAction::FanHigh, FanHigh},
+#endif
+#if TERMINAL_SUPPORT
+    {ButtonAction::TerminalCommand, TerminalCommand},
+#endif
+};
+
+} // namespace query
+} // namespace settings
+} // namespace
+} // namespace button
 
 namespace settings {
 namespace internal {
+namespace {
+
+using espurna::button::settings::options::DebounceEventMode;
+using espurna::button::settings::options::DebounceEventPinValue;
+using espurna::button::settings::options::DebounceEventPinMode;
+using espurna::button::settings::options::ButtonProviderOptions;
+using espurna::button::settings::options::ButtonActionOptions;
+
+} // namespace
 
 template<>
 debounce_event::types::Mode convert(const String& value) {
-    switch (value.toInt()) {
-        case 1:
-            return debounce_event::types::Mode::Switch;
-        case 0:
-        default:
-            return debounce_event::types::Mode::Pushbutton;
-    }
+    return convert(DebounceEventMode, value, debounce_event::types::Mode::Pushbutton);
 }
 
 String serialize(debounce_event::types::Mode value) {
-    String result;
-    switch (value) {
-        case debounce_event::types::Mode::Switch:
-            result = "1";
-            break;
-        case debounce_event::types::Mode::Pushbutton:
-        default:
-            result = "0";
-            break;
-    }
-    return result;
+    return serialize(DebounceEventMode, value);
 }
 
 template<>
 debounce_event::types::PinValue convert(const String& value) {
-    switch (value.toInt()) {
-        case 1:
-            return debounce_event::types::PinValue::High;
-        case 2:
-            return debounce_event::types::PinValue::Initial;
-        default:
-        case 0:
-            return debounce_event::types::PinValue::Low;
-    }
+    return convert(DebounceEventPinValue, value, debounce_event::types::PinValue::Low);
 }
 
 String serialize(debounce_event::types::PinValue value) {
-    String result;
-    switch (value) {
-        case debounce_event::types::PinValue::Low:
-            result = "0";
-            break;
-        case debounce_event::types::PinValue::High:
-            result = "1";
-            break;
-        case debounce_event::types::PinValue::Initial:
-            result = "2";
-            break;
-    }
-    return result;
+    return serialize(DebounceEventPinValue, value);
 }
 
 template<>
 debounce_event::types::PinMode convert(const String& value) {
-    switch (value.toInt()) {
-        case 1:
-            return debounce_event::types::PinMode::InputPullup;
-        case 2:
-            return debounce_event::types::PinMode::InputPulldown;
-        case 0:
-        default:
-            return debounce_event::types::PinMode::Input;
-    }
+    return convert(DebounceEventPinMode, value, debounce_event::types::PinMode::Input);
 }
 
 String serialize(debounce_event::types::PinMode mode) {
-    String result;
-    switch (mode) {
-        case debounce_event::types::PinMode::InputPullup:
-            result = "1";
-            break;
-        case debounce_event::types::PinMode::InputPulldown:
-            result = "2";
-            break;
-        case debounce_event::types::PinMode::Input:
-        default:
-            result = "0";
-            break;
-    }
-    return result;
+    return serialize(DebounceEventPinMode, mode);
 }
 
 template <>
 ButtonProvider convert(const String& value) {
-    auto type = static_cast<ButtonProvider>(value.toInt());
-    switch (type) {
-    case ButtonProvider::None:
-    case ButtonProvider::Gpio:
-    case ButtonProvider::Analog:
-        return type;
-    }
+    return convert(ButtonProviderOptions, value, ButtonProvider::None);
+}
 
-    return ButtonProvider::None;
+String serialize(ButtonProvider value) {
+    return serialize(ButtonProviderOptions, value);
 }
 
 template<>
 ButtonAction convert(const String& value) {
-    auto num = strtoul(value.c_str(), nullptr, 10);
-    if (num < ButtonsActionMax) {
-        auto action = static_cast<ButtonAction>(num);
-        switch (action) {
-        case ButtonAction::None:
-        case ButtonAction::Toggle:
-        case ButtonAction::On:
-        case ButtonAction::Off:
-        case ButtonAction::AccessPoint:
-        case ButtonAction::Reset:
-        case ButtonAction::Pulse:
-        case ButtonAction::FactoryReset:
-        case ButtonAction::Wps:
-        case ButtonAction::SmartConfig:
-        case ButtonAction::BrightnessIncrease:
-        case ButtonAction::BrightnessDecrease:
-        case ButtonAction::DisplayOn:
-        case ButtonAction::Custom:
-        case ButtonAction::FanLow:
-        case ButtonAction::FanMedium:
-        case ButtonAction::FanHigh:
-            return action;
-        }
-    }
+    return convert(ButtonActionOptions, value, ButtonAction::None);
+}
 
-    return ButtonAction::None;
+String serialize(::ButtonAction value) {
+    return serialize(ButtonActionOptions, value);
 }
 
 } // namespace internal
@@ -168,19 +282,627 @@ ButtonAction convert(const String& value) {
 
 // -----------------------------------------------------------------------------
 
-constexpr ButtonAction _buttonDecodeEventAction(const ButtonActions& actions, ButtonEvent event) {
+namespace button {
+namespace {
+
+namespace internal {
+
+std::vector<Button> buttons;
+
+} // namespace internal
+
+namespace build {
+
+constexpr size_t pin(size_t index) {
     return (
-        (event == ButtonEvent::Pressed) ? actions.pressed :
-        (event == ButtonEvent::Released) ? actions.released :
-        (event == ButtonEvent::Click) ? actions.click :
-        (event == ButtonEvent::DoubleClick) ? actions.dblclick :
-        (event == ButtonEvent::LongClick) ? actions.lngclick :
-        (event == ButtonEvent::LongLongClick) ? actions.lnglngclick :
-        (event == ButtonEvent::TripleClick) ? actions.trplclick : ButtonAction::None
+        (index == 0) ? BUTTON1_PIN :
+        (index == 1) ? BUTTON2_PIN :
+        (index == 2) ? BUTTON3_PIN :
+        (index == 3) ? BUTTON4_PIN :
+        (index == 4) ? BUTTON5_PIN :
+        (index == 5) ? BUTTON6_PIN :
+        (index == 6) ? BUTTON7_PIN :
+        (index == 7) ? BUTTON8_PIN : GPIO_NONE
     );
 }
 
-constexpr ButtonEvent _buttonMapReleased(uint8_t count, unsigned long length, unsigned long lngclick_delay, unsigned long lnglngclick_delay) {
+constexpr GpioType pinType(size_t index) {
+    return (
+        (index == 0) ? BUTTON1_PIN_TYPE :
+        (index == 1) ? BUTTON2_PIN_TYPE :
+        (index == 2) ? BUTTON3_PIN_TYPE :
+        (index == 3) ? BUTTON4_PIN_TYPE :
+        (index == 4) ? BUTTON5_PIN_TYPE :
+        (index == 5) ? BUTTON6_PIN_TYPE :
+        (index == 6) ? BUTTON7_PIN_TYPE :
+        (index == 7) ? BUTTON8_PIN_TYPE : GPIO_TYPE_NONE
+    );
+}
+
+namespace internal {
+namespace ButtonMask {
+
+constexpr int Pushbutton { 1 << 0 };
+constexpr int Switch { 1 << 1 };
+constexpr int DefaultLow { 1 << 2 };
+constexpr int DefaultHigh { 1 << 3 };
+constexpr int DefaultBoot { 1 << 4 };
+constexpr int SetPullup { 1 << 5 };
+constexpr int SetPulldown { 1 << 6 };
+
+} // namespace ButtonMask
+
+constexpr int configBitmask(size_t index) {
+    return (
+        (index == 0) ? (BUTTON1_CONFIG) :
+        (index == 1) ? (BUTTON2_CONFIG) :
+        (index == 2) ? (BUTTON3_CONFIG) :
+        (index == 3) ? (BUTTON4_CONFIG) :
+        (index == 4) ? (BUTTON5_CONFIG) :
+        (index == 5) ? (BUTTON6_CONFIG) :
+        (index == 6) ? (BUTTON7_CONFIG) :
+        (index == 7) ? (BUTTON8_CONFIG) : (BUTTON_PUSHBUTTON | BUTTON_SET_PULLUP | BUTTON_DEFAULT_HIGH)
+    );
+}
+
+constexpr debounce_event::types::Config decode(int bitmask) {
+    return {
+        .mode = ((bitmask & ButtonMask::Pushbutton)
+            ? debounce_event::types::Mode::Pushbutton
+            : debounce_event::types::Mode::Switch),
+        .default_value = ((bitmask & ButtonMask::DefaultLow) ? debounce_event::types::PinValue::Low
+         : (bitmask & ButtonMask::DefaultHigh) ? debounce_event::types::PinValue::High
+         : (bitmask & ButtonMask::DefaultBoot) ? debounce_event::types::PinValue::Initial
+            : debounce_event::types::PinValue::Low),
+        .pin_mode = ((bitmask & ButtonMask::SetPullup) ? debounce_event::types::PinMode::InputPullup
+            : (bitmask & ButtonMask::SetPulldown) ? debounce_event::types::PinMode::InputPulldown
+            : debounce_event::types::PinMode::Input)
+    };
+}
+
+constexpr debounce_event::types::Mode mode(size_t index) {
+    return decode(configBitmask(index)).mode;
+}
+
+constexpr debounce_event::types::PinValue defaultValue(size_t index) {
+    return decode(configBitmask(index)).default_value;
+}
+
+constexpr debounce_event::types::PinMode pinMode(size_t index) {
+    return decode(configBitmask(index)).pin_mode;
+}
+
+} // namespace internal
+
+constexpr debounce_event::types::Mode mode(size_t index) {
+    return internal::mode(index);
+}
+
+constexpr debounce_event::types::PinValue defaultValue(size_t index) {
+    return internal::defaultValue(index);
+}
+
+constexpr debounce_event::types::PinMode pinMode(size_t index) {
+    return internal::pinMode(index);
+}
+
+constexpr ButtonAction release(size_t index) {
+    return (
+        (index == 0) ? BUTTON1_RELEASE :
+        (index == 1) ? BUTTON2_RELEASE :
+        (index == 2) ? BUTTON3_RELEASE :
+        (index == 3) ? BUTTON4_RELEASE :
+        (index == 4) ? BUTTON5_RELEASE :
+        (index == 5) ? BUTTON6_RELEASE :
+        (index == 6) ? BUTTON7_RELEASE :
+        (index == 7) ? BUTTON8_RELEASE : BUTTON_ACTION_NONE
+    );
+}
+
+constexpr ButtonAction press(size_t index) {
+    return (
+        (index == 0) ? BUTTON1_PRESS :
+        (index == 1) ? BUTTON2_PRESS :
+        (index == 2) ? BUTTON3_PRESS :
+        (index == 3) ? BUTTON4_PRESS :
+        (index == 4) ? BUTTON5_PRESS :
+        (index == 5) ? BUTTON6_PRESS :
+        (index == 6) ? BUTTON7_PRESS :
+        (index == 7) ? BUTTON8_PRESS : BUTTON_ACTION_NONE
+    );
+}
+
+constexpr ButtonAction click(size_t index) {
+    return (
+        (index == 0) ? BUTTON1_CLICK :
+        (index == 1) ? BUTTON2_CLICK :
+        (index == 2) ? BUTTON3_CLICK :
+        (index == 3) ? BUTTON4_CLICK :
+        (index == 4) ? BUTTON5_CLICK :
+        (index == 5) ? BUTTON6_CLICK :
+        (index == 6) ? BUTTON7_CLICK :
+        (index == 7) ? BUTTON8_CLICK : BUTTON_ACTION_NONE
+    );
+}
+
+constexpr ButtonAction doubleClick(size_t index) {
+    return (
+        (index == 0) ? BUTTON1_DBLCLICK :
+        (index == 1) ? BUTTON2_DBLCLICK :
+        (index == 2) ? BUTTON3_DBLCLICK :
+        (index == 3) ? BUTTON4_DBLCLICK :
+        (index == 4) ? BUTTON5_DBLCLICK :
+        (index == 5) ? BUTTON6_DBLCLICK :
+        (index == 6) ? BUTTON7_DBLCLICK :
+        (index == 7) ? BUTTON8_DBLCLICK : BUTTON_ACTION_NONE
+    );
+}
+
+constexpr ButtonAction tripleClick(size_t index) {
+    return (
+        (index == 0) ? BUTTON1_TRIPLECLICK :
+        (index == 1) ? BUTTON2_TRIPLECLICK :
+        (index == 2) ? BUTTON3_TRIPLECLICK :
+        (index == 3) ? BUTTON4_TRIPLECLICK :
+        (index == 4) ? BUTTON5_TRIPLECLICK :
+        (index == 5) ? BUTTON6_TRIPLECLICK :
+        (index == 6) ? BUTTON7_TRIPLECLICK :
+        (index == 7) ? BUTTON8_TRIPLECLICK : BUTTON_ACTION_NONE
+    );
+}
+
+constexpr ButtonAction longClick(size_t index) {
+    return (
+        (index == 0) ? BUTTON1_LNGCLICK :
+        (index == 1) ? BUTTON2_LNGCLICK :
+        (index == 2) ? BUTTON3_LNGCLICK :
+        (index == 3) ? BUTTON4_LNGCLICK :
+        (index == 4) ? BUTTON5_LNGCLICK :
+        (index == 5) ? BUTTON6_LNGCLICK :
+        (index == 6) ? BUTTON7_LNGCLICK :
+        (index == 7) ? BUTTON8_LNGCLICK : BUTTON_ACTION_NONE
+    );
+}
+
+constexpr ButtonAction longLongClick(size_t index) {
+    return (
+        (index == 0) ? BUTTON1_LNGLNGCLICK :
+        (index == 1) ? BUTTON2_LNGLNGCLICK :
+        (index == 2) ? BUTTON3_LNGLNGCLICK :
+        (index == 3) ? BUTTON4_LNGLNGCLICK :
+        (index == 4) ? BUTTON5_LNGLNGCLICK :
+        (index == 5) ? BUTTON6_LNGLNGCLICK :
+        (index == 6) ? BUTTON7_LNGLNGCLICK :
+        (index == 7) ? BUTTON8_LNGLNGCLICK : BUTTON_ACTION_NONE
+    );
+}
+
+constexpr size_t relay(size_t index) {
+    return (
+        (index == 0) ? (BUTTON1_RELAY - 1) :
+        (index == 1) ? (BUTTON2_RELAY - 1) :
+        (index == 2) ? (BUTTON3_RELAY - 1) :
+        (index == 3) ? (BUTTON4_RELAY - 1) :
+        (index == 4) ? (BUTTON5_RELAY - 1) :
+        (index == 5) ? (BUTTON6_RELAY - 1) :
+        (index == 6) ? (BUTTON7_RELAY - 1) :
+        (index == 7) ? (BUTTON8_RELAY - 1) : RELAY_NONE
+    );
+}
+
+constexpr unsigned long debounceDelay() {
+    return BUTTON_DEBOUNCE_DELAY;
+}
+
+constexpr unsigned long debounceDelay(size_t index) {
+    return (
+        (index == 0) ? BUTTON1_DEBOUNCE_DELAY :
+        (index == 1) ? BUTTON2_DEBOUNCE_DELAY :
+        (index == 2) ? BUTTON3_DEBOUNCE_DELAY :
+        (index == 3) ? BUTTON4_DEBOUNCE_DELAY :
+        (index == 4) ? BUTTON5_DEBOUNCE_DELAY :
+        (index == 5) ? BUTTON6_DEBOUNCE_DELAY :
+        (index == 6) ? BUTTON7_DEBOUNCE_DELAY :
+        (index == 7) ? BUTTON8_DEBOUNCE_DELAY : debounceDelay()
+    );
+}
+
+constexpr unsigned long repeatDelay() {
+    return BUTTON_REPEAT_DELAY;
+}
+
+constexpr unsigned long repeatDelay(size_t index) {
+    return (
+        (index == 0) ? BUTTON1_REPEAT_DELAY :
+        (index == 1) ? BUTTON2_REPEAT_DELAY :
+        (index == 2) ? BUTTON3_REPEAT_DELAY :
+        (index == 3) ? BUTTON4_REPEAT_DELAY :
+        (index == 4) ? BUTTON5_REPEAT_DELAY :
+        (index == 5) ? BUTTON6_REPEAT_DELAY :
+        (index == 6) ? BUTTON7_REPEAT_DELAY :
+        (index == 7) ? BUTTON8_REPEAT_DELAY : repeatDelay()
+    );
+}
+
+constexpr unsigned long longClickDelay() {
+    return BUTTON_LNGCLICK_DELAY;
+}
+
+constexpr unsigned long longClickDelay(size_t index) {
+    return (
+        (index == 0) ? BUTTON1_LNGCLICK_DELAY :
+        (index == 1) ? BUTTON2_LNGCLICK_DELAY :
+        (index == 2) ? BUTTON3_LNGCLICK_DELAY :
+        (index == 3) ? BUTTON4_LNGCLICK_DELAY :
+        (index == 4) ? BUTTON5_LNGCLICK_DELAY :
+        (index == 5) ? BUTTON6_LNGCLICK_DELAY :
+        (index == 6) ? BUTTON7_LNGCLICK_DELAY :
+        (index == 7) ? BUTTON8_LNGCLICK_DELAY : longClickDelay()
+    );
+}
+
+constexpr unsigned long longLongClickDelay() {
+    return BUTTON_LNGLNGCLICK_DELAY;
+}
+
+constexpr unsigned long longLongClickDelay(size_t index) {
+    return (
+        (index == 0) ? BUTTON1_LNGLNGCLICK_DELAY :
+        (index == 1) ? BUTTON2_LNGLNGCLICK_DELAY :
+        (index == 2) ? BUTTON3_LNGLNGCLICK_DELAY :
+        (index == 3) ? BUTTON4_LNGLNGCLICK_DELAY :
+        (index == 4) ? BUTTON5_LNGLNGCLICK_DELAY :
+        (index == 5) ? BUTTON6_LNGLNGCLICK_DELAY :
+        (index == 6) ? BUTTON7_LNGLNGCLICK_DELAY :
+        (index == 7) ? BUTTON8_LNGLNGCLICK_DELAY : longLongClickDelay()
+    );
+}
+
+constexpr bool mqttSendAllEvents() {
+    return (1 == BUTTON_MQTT_SEND_ALL_EVENTS);
+}
+
+constexpr bool mqttSendAllEvents(size_t index) {
+    return (
+        (index == 0) ? (1 == BUTTON1_MQTT_SEND_ALL_EVENTS) :
+        (index == 1) ? (1 == BUTTON2_MQTT_SEND_ALL_EVENTS) :
+        (index == 2) ? (1 == BUTTON3_MQTT_SEND_ALL_EVENTS) :
+        (index == 3) ? (1 == BUTTON4_MQTT_SEND_ALL_EVENTS) :
+        (index == 4) ? (1 == BUTTON5_MQTT_SEND_ALL_EVENTS) :
+        (index == 5) ? (1 == BUTTON6_MQTT_SEND_ALL_EVENTS) :
+        (index == 6) ? (1 == BUTTON7_MQTT_SEND_ALL_EVENTS) :
+        (index == 7) ? (1 == BUTTON8_MQTT_SEND_ALL_EVENTS) : mqttSendAllEvents()
+    );
+}
+
+constexpr bool mqttRetain() {
+    return (1 == BUTTON_MQTT_RETAIN);
+}
+
+constexpr bool mqttRetain(size_t index) {
+    return (
+        (index == 0) ? (1 == BUTTON1_MQTT_RETAIN) :
+        (index == 1) ? (1 == BUTTON2_MQTT_RETAIN) :
+        (index == 2) ? (1 == BUTTON3_MQTT_RETAIN) :
+        (index == 3) ? (1 == BUTTON4_MQTT_RETAIN) :
+        (index == 4) ? (1 == BUTTON5_MQTT_RETAIN) :
+        (index == 5) ? (1 == BUTTON6_MQTT_RETAIN) :
+        (index == 6) ? (1 == BUTTON7_MQTT_RETAIN) :
+        (index == 7) ? (1 == BUTTON8_MQTT_RETAIN) : mqttRetain()
+    );
+}
+
+constexpr ButtonProvider provider(size_t index) {
+    return (
+        (index == 0) ? (BUTTON1_PROVIDER) :
+        (index == 1) ? (BUTTON2_PROVIDER) :
+        (index == 2) ? (BUTTON3_PROVIDER) :
+        (index == 3) ? (BUTTON4_PROVIDER) :
+        (index == 4) ? (BUTTON5_PROVIDER) :
+        (index == 5) ? (BUTTON6_PROVIDER) :
+        (index == 6) ? (BUTTON7_PROVIDER) :
+        (index == 7) ? (BUTTON8_PROVIDER) : BUTTON_PROVIDER_NONE
+    );
+}
+
+[[gnu::unused]] constexpr int analogLevel(size_t index) {
+    return (
+        (index == 0) ? (BUTTON1_ANALOG_LEVEL) :
+        (index == 1) ? (BUTTON2_ANALOG_LEVEL) :
+        (index == 2) ? (BUTTON3_ANALOG_LEVEL) :
+        (index == 3) ? (BUTTON4_ANALOG_LEVEL) :
+        (index == 4) ? (BUTTON5_ANALOG_LEVEL) :
+        (index == 5) ? (BUTTON6_ANALOG_LEVEL) :
+        (index == 6) ? (BUTTON7_ANALOG_LEVEL) :
+        (index == 7) ? (BUTTON8_ANALOG_LEVEL) : 0
+    );
+}
+
+} // namespace build
+
+namespace settings {
+
+STRING_VIEW_INLINE(Prefix, "btn");
+
+namespace internal {
+
+template <typename T>
+T indexedThenGlobal(const String& prefix, size_t index, T defaultValue) {
+    const auto key = espurna::settings::Key{prefix, index};
+
+    auto& instance = espurna::settings::kvs_instance();
+
+    const auto indexed = instance.get(key.value());
+    if (indexed) {
+        return espurna::settings::internal::convert<T>(indexed.ref());
+    }
+
+    const auto global = instance.get(prefix);
+    if (global) {
+        return espurna::settings::internal::convert<T>(global.ref());
+    }
+
+    return defaultValue;
+}
+
+} // namespace internal
+
+unsigned char pin(size_t index) {
+    return getSetting({keys::Gpio, index}, build::pin(index));
+}
+
+GpioType pinType(size_t index) {
+    return getSetting({keys::GpioType, index}, build::pinType(index));
+}
+
+ButtonProvider provider(size_t index) {
+    return getSetting({keys::Provider, index}, build::provider(index));
+}
+
+debounce_event::types::Mode mode(size_t index) {
+    return getSetting({keys::Mode, index}, build::mode(index));
+}
+
+debounce_event::types::PinValue defaultValue(size_t index) {
+    return getSetting({keys::DefaultValue, index}, build::defaultValue(index));
+}
+
+debounce_event::types::PinMode pinMode(size_t index) {
+    return getSetting({keys::PinMode, index}, build::pinMode(index));
+}
+
+ButtonAction release(size_t index) {
+    return getSetting({keys::Release, index}, build::release(index));
+}
+
+ButtonAction press(size_t index) {
+    return getSetting({keys::Press, index}, build::press(index));
+}
+
+ButtonAction click(size_t index) {
+    return getSetting({keys::Click, index}, build::click(index));
+}
+
+ButtonAction doubleClick(size_t index) {
+   return getSetting({keys::DoubleClick, index}, build::doubleClick(index));
+}
+
+ButtonAction tripleClick(size_t index) {
+   return getSetting({keys::TripleClick, index}, build::tripleClick(index));
+}
+
+ButtonAction longClick(size_t index) {
+   return getSetting({keys::LongClick, index}, build::longClick(index));
+}
+
+ButtonAction longLongClick(size_t index) {
+   return getSetting({keys::LongLongClick, index}, build::longLongClick(index));
+}
+
+unsigned long debounceDelay(size_t index) {
+    return internal::indexedThenGlobal(keys::DebounceDelay, index, build::debounceDelay(index));
+}
+
+unsigned long longClickDelay(size_t index) {
+    return internal::indexedThenGlobal(keys::LongClickDelay, index, build::longClickDelay(index));
+}
+
+unsigned long longLongClickDelay(size_t index) {
+    return internal::indexedThenGlobal(keys::LongLongClickDelay, index, build::longLongClickDelay(index));
+}
+
+[[gnu::unused]]
+unsigned long repeatDelay() {
+    return getSetting(keys::RepeatDelay, build::repeatDelay());
+}
+
+unsigned long repeatDelay(size_t index) {
+    return internal::indexedThenGlobal(keys::RepeatDelay, index, build::repeatDelay(index));
+}
+
+[[gnu::unused]]
+size_t relay(size_t index) {
+    return getSetting({keys::Relay, index}, build::relay(index));
+}
+
+[[gnu::unused]]
+bool mqttSendAllEvents(size_t index) {
+    return getSetting({keys::MqttSendAll, index}, build::mqttSendAllEvents(index));
+}
+
+[[gnu::unused]]
+bool mqttRetain(size_t index) {
+    return getSetting({keys::MqttRetain, index}, build::mqttRetain(index));
+}
+
+#if BUTTON_PROVIDER_ANALOG_SUPPORT
+int analogLevel(size_t index) {
+    return getSetting({keys::AnalogLevel, index}, build::analogLevel(index));
+}
+#endif
+
+#if TERMINAL_SUPPORT
+String terminalCommand(size_t index) {
+    return getSetting({keys::TerminalCommand, index});
+}
+#endif
+
+namespace query {
+namespace internal {
+
+#define ID_VALUE(NAME, FUNC)\
+String NAME (size_t id) {\
+    return espurna::settings::internal::serialize(FUNC(id));\
+}
+
+ID_VALUE(pin, settings::pin)
+ID_VALUE(pinType, settings::pinType)
+ID_VALUE(provider, settings::provider)
+ID_VALUE(mode, settings::mode)
+ID_VALUE(defaultValue, settings::defaultValue)
+ID_VALUE(pinMode, settings::pinMode)
+ID_VALUE(release, settings::release)
+ID_VALUE(press, settings::press)
+ID_VALUE(click, settings::click)
+ID_VALUE(doubleClick, settings::doubleClick)
+ID_VALUE(tripleClick, settings::tripleClick)
+ID_VALUE(longClick, settings::longClick)
+ID_VALUE(longLongClick, settings::longLongClick)
+ID_VALUE(debounceDelay, settings::debounceDelay)
+ID_VALUE(longClickDelay, settings::longClickDelay)
+ID_VALUE(longLongClickDelay, settings::longLongClickDelay)
+
+#if RELAY_SUPPORT
+ID_VALUE(relay, settings::relay)
+#endif
+
+#if MQTT_SUPPORT
+ID_VALUE(mqttSendAllEvents, settings::mqttSendAllEvents)
+ID_VALUE(mqttRetain, settings::mqttRetain)
+#endif
+
+#undef ID_VALUE
+
+} // namespace internal
+
+static constexpr espurna::settings::query::IndexedSetting IndexedSettings[] PROGMEM {
+    {keys::Gpio, internal::pin},
+    {keys::GpioType, internal::pinType},
+    {keys::Provider, internal::provider},
+    {keys::Mode, internal::mode},
+    {keys::DefaultValue, internal::defaultValue},
+    {keys::PinMode, internal::pinMode},
+    {keys::Release, internal::release},
+    {keys::Press, internal::press},
+    {keys::Click, internal::click},
+    {keys::DoubleClick, internal::doubleClick},
+    {keys::TripleClick, internal::tripleClick},
+    {keys::LongClick, internal::longClick},
+    {keys::LongLongClick, internal::longLongClick},
+    {keys::DebounceDelay, internal::debounceDelay},
+    {keys::LongClickDelay, internal::longClickDelay},
+    {keys::LongLongClickDelay, internal::longLongClickDelay},
+#if RELAY_SUPPORT
+    {keys::Relay, internal::relay},
+#endif
+#if MQTT_SUPPORT
+    {keys::MqttSendAll, internal::mqttSendAllEvents},
+    {keys::MqttRetain, internal::mqttRetain},
+#endif
+#if TERMINAL_SUPPORT
+    {keys::TerminalCommand, settings::terminalCommand},
+#endif
+};
+
+bool checkSamePrefix(StringView key) {
+    return key.startsWith(espurna::button::settings::Prefix);
+}
+
+espurna::settings::query::Result findFrom(StringView key) {
+    return espurna::settings::query::findFrom(
+        button::internal::buttons.size(), IndexedSettings, key);
+}
+
+void setup() {
+    settingsRegisterQueryHandler({
+        .check = checkSamePrefix,
+        .get = findFrom,
+    });
+}
+
+} // namespace query
+} // namespace settings
+
+namespace terminal {
+namespace internal {
+
+void inject(String command) {
+    static EphemeralPrint output;
+    PrintString error(64);
+
+    if (!espurna::terminal::api_find_and_call(command, output, error)) {
+        DEBUG_MSG_P(PSTR("[BUTTON] \"%s\"\n"), error.c_str());
+    }
+}
+
+} // namespace internal
+
+void process(size_t id) {
+    auto cmd = settings::terminalCommand(id);
+    if (!cmd.length()) {
+        return;
+    }
+
+    internal::inject(std::move(cmd));
+}
+
+void button(::terminal::CommandContext&& ctx) {
+    if (ctx.argv.size() == 2) {
+        size_t id;
+        if (!tryParseId(ctx.argv[1], buttonCount(), id)) {
+            terminalError(ctx, F("Invalid button ID"));
+            return;
+        }
+
+        settingsDump(ctx, espurna::button::settings::query::IndexedSettings, id);
+        terminalOK(ctx);
+        return;
+    }
+
+    size_t id { 0 };
+    for (const auto& button : espurna::button::internal::buttons) {
+        ctx.output.printf_P(
+            PSTR("button%u {%s}\n"), id++,
+            button.event_emitter
+                ? (button.event_emitter->pin()->description().c_str())
+                : PSTR("Virtual"));
+    }
+}
+
+PROGMEM_STRING(Button, "BUTTON");
+
+static constexpr ::terminal::Command Commands[] PROGMEM {
+    {Button, button},
+};
+
+void setup() {
+    espurna::terminal::add(Commands);
+}
+
+} // namespace terminal
+
+Button::Button(ButtonActions&& actions_, ButtonEventDelays&& delays_) :
+    actions(std::move(actions_)),
+    event_delays(std::move(delays_))
+{}
+
+Button::Button(BasePinPtr&& pin, const debounce_event::types::Config& config, ButtonActions&& actions_, ButtonEventDelays&& delays_) :
+    event_emitter(std::make_unique<debounce_event::EventEmitter>(std::move(pin), config, delays_.debounce, delays_.repeat)),
+    actions(std::move(actions_)),
+    event_delays(std::move(delays_))
+{}
+
+constexpr ButtonEvent map_released(uint8_t count, unsigned long length, unsigned long lngclick_delay, unsigned long lnglngclick_delay) {
     return (
         (0 == count) ? ButtonEvent::Released :
         (1 == count) ? (
@@ -193,68 +915,13 @@ constexpr ButtonEvent _buttonMapReleased(uint8_t count, unsigned long length, un
     );
 }
 
-ButtonActions _buttonConstructActions(size_t index) {
-    return {
-        button::build::press(index),
-        button::build::release(index),
-        button::build::click(index),
-        button::build::doubleClick(index),
-        button::build::longClick(index),
-        button::build::longLongClick(index),
-        button::build::tripleClick(index)
-    };
-}
-
-debounce_event::types::Config _buttonRuntimeConfig(size_t index) {
-    return {
-        getSetting({"btnMode", index}, button::build::mode(index)),
-        getSetting({"btnDefVal", index}, button::build::defaultValue(index)),
-        getSetting({"btnPinMode", index}, button::build::pinMode(index))
-    };
-}
-
-int _buttonEventNumber(ButtonEvent event) {
-    return static_cast<int>(event);
-}
-
-// -----------------------------------------------------------------------------
-
-ButtonEventDelays::ButtonEventDelays() :
-    debounce(button::build::debounceDelay()),
-    repeat(button::build::repeatDelay()),
-    lngclick(button::build::longClickDelay()),
-    lnglngclick(button::build::longLongClickDelay())
-{}
-
-ButtonEventDelays::ButtonEventDelays(unsigned long debounce, unsigned long repeat, unsigned long lngclick, unsigned long lnglngclick) :
-    debounce(debounce),
-    repeat(repeat),
-    lngclick(lngclick),
-    lnglngclick(lnglngclick)
-{}
-
-button_t::button_t(ButtonActions&& actions_, ButtonEventDelays&& delays_) :
-    actions(std::move(actions_)),
-    event_delays(std::move(delays_))
-{}
-
-button_t::button_t(BasePinPtr&& pin, const debounce_event::types::Config& config, ButtonActions&& actions_, ButtonEventDelays&& delays_) :
-    event_emitter(std::make_unique<debounce_event::EventEmitter>(std::move(pin), config, delays_.debounce, delays_.repeat)),
-    actions(std::move(actions_)),
-    event_delays(std::move(delays_))
-{}
-
-bool button_t::state() {
-    return event_emitter->isPressed();
-}
-
-ButtonEvent button_t::loop() {
+ButtonEvent Button::loop() {
     if (event_emitter) {
         switch (event_emitter->loop()) {
         case debounce_event::types::EventPressed:
             return ButtonEvent::Pressed;
         case debounce_event::types::EventReleased: {
-            return _buttonMapReleased(
+            return map_released(
                 event_emitter->getEventCount(),
                 event_emitter->getEventLength(),
                 event_delays.lngclick,
@@ -269,26 +936,52 @@ ButtonEvent button_t::loop() {
     return ButtonEvent::None;
 }
 
-std::vector<button_t> _buttons;
+constexpr ButtonAction decode_actions_event(const ButtonActions& actions, ButtonEvent event) {
+    return (
+        (event == ButtonEvent::Pressed) ? actions.pressed :
+        (event == ButtonEvent::Released) ? actions.released :
+        (event == ButtonEvent::Click) ? actions.click :
+        (event == ButtonEvent::DoubleClick) ? actions.dblclick :
+        (event == ButtonEvent::LongClick) ? actions.lngclick :
+        (event == ButtonEvent::LongLongClick) ? actions.lnglngclick :
+        (event == ButtonEvent::TripleClick) ? actions.trplclick : ButtonAction::None
+    );
+}
+
+debounce_event::types::Config runtime_config(size_t index) {
+    return {
+        espurna::button::settings::mode(index),
+        espurna::button::settings::defaultValue(index),
+        espurna::button::settings::pinMode(index)};
+}
+
+} // namespace
+} // namespace button
+} // namespace espurna
 
 // -----------------------------------------------------------------------------
 
 size_t buttonCount() {
-    return _buttons.size();
+    return espurna::button::internal::buttons.size();
 }
 
 #if MQTT_SUPPORT
 
+namespace {
+
 std::bitset<ButtonsMax> _buttons_mqtt_send_all(
-    button::build::mqttSendAllEvents()
+    espurna::button::build::mqttSendAllEvents()
     ? std::numeric_limits<unsigned long>::max()
     : std::numeric_limits<unsigned long>::min()
 );
+
 std::bitset<ButtonsMax> _buttons_mqtt_retain(
-    button::build::mqttRetain()
+    espurna::button::build::mqttRetain()
     ? std::numeric_limits<unsigned long>::max()
     : std::numeric_limits<unsigned long>::min()
 );
+
+} // namespace
 
 #endif
 
@@ -296,14 +989,73 @@ std::bitset<ButtonsMax> _buttons_mqtt_retain(
 
 #if RELAY_SUPPORT
 
-std::vector<unsigned char> _button_relays;
+namespace espurna {
+namespace button {
+namespace {
 
-size_t _buttonRelay(size_t id) {
-    return _button_relays[id];
+namespace relay {
+
+struct Pair {
+    unsigned char button_id;
+    unsigned char relay_id;
+};
+
+namespace internal {
+
+std::forward_list<Pair> relays;
+
+} // namespace internal
+
+void remove(unsigned char buttonId) {
+    internal::relays.remove_if(
+        [&](const Pair& pair) {
+            return pair.button_id == buttonId;
+        });
 }
 
-void _buttonRelayAction(size_t id, ButtonAction action) {
-    auto relayId = _buttonRelay(id);
+Pair* find(size_t id) {
+    auto it = std::find_if(
+        internal::relays.begin(),
+        internal::relays.end(),
+        [&](const Pair& pair) {
+            return pair.button_id == id;
+        });
+
+    if (it != internal::relays.end()) {
+        return std::addressof(*it);
+    }
+
+    return nullptr;
+}
+
+void add_or_remove(unsigned char buttonId, unsigned char relayId) {
+    if (relayId == RELAY_NONE) {
+        remove(buttonId);
+        return;
+    }
+
+    auto it = find(buttonId);
+    if (it) {
+        (*it).relay_id = relayId;
+    } else {
+        internal::relays.push_front(Pair{
+            .button_id = buttonId,
+            .relay_id = relayId,
+        });
+    }
+}
+
+size_t get(size_t id) {
+    auto it = find(id);
+    if (it) {
+        return (*it).relay_id;
+    }
+
+    return RelaysMax;
+}
+
+void process_action(size_t id, ButtonAction action) {
+    auto relayId = get(id);
 
     switch (action) {
     case ButtonAction::Toggle:
@@ -319,7 +1071,9 @@ void _buttonRelayAction(size_t id, ButtonAction action) {
         break;
 
     case ButtonAction::Pulse:
-        // TODO
+        // TODO ???
+        //      needs 'normal' status and (parsed) time
+        //      why use this instead of relay{Time,Pulse}?
         break;
 
     default:
@@ -327,140 +1081,152 @@ void _buttonRelayAction(size_t id, ButtonAction action) {
     }
 }
 
+} // namespace relay
+
+} // namespace
+} // namespace button
+} // namespace espurna
+
 #endif // RELAY_SUPPORT
 
 // -----------------------------------------------------------------------------
 
 #if WEB_SUPPORT
-
 namespace {
 
 void _buttonWebSocketOnVisible(JsonObject& root) {
-    if (buttonCount()) {
-        root["btnVisible"] = 1;
-    }
+    wsPayloadModule(root, espurna::button::settings::Prefix);
 }
 
 void _buttonWebSocketOnConnected(JsonObject& root) {
     if (buttonCount()) {
-        root["btnRepDel"] = getSetting("btnRepDel", button::build::repeatDelay());
+        root["btnRepDel"] = espurna::button::settings::repeatDelay();
     }
 }
 
-bool _buttonWebSocketOnKeyCheck(const char * key, JsonVariant&) {
-    return (strncmp(key, "btn", 3) == 0);
+bool _buttonWebSocketOnKeyCheck(espurna::StringView key, const JsonVariant&) {
+    return espurna::button::settings::query::checkSamePrefix(key);
 }
 
 } // namespace
-
 #endif // WEB_SUPPORT
 
 //------------------------------------------------------------------------------
 
-ButtonEventHandler _button_custom_action { nullptr };
+static ButtonEventHandler _button_custom_action { nullptr };
 
 void buttonSetCustomAction(ButtonEventHandler handler) {
     _button_custom_action = handler;
 }
 
-std::forward_list<ButtonEventHandler> _button_notify_event;
+static std::forward_list<ButtonEventHandler> _button_notify_event;
 
-void buttonSetEventNotify(ButtonEventHandler handler) {
+void buttonOnEvent(ButtonEventHandler handler) {
     _button_notify_event.push_front(handler);
 }
 
 //------------------------------------------------------------------------------
 
-bool buttonState(size_t id) {
-    return (id < _buttons.size())
-        ? _buttons[id].state()
-        : false;
-}
-
 ButtonAction buttonAction(size_t id, ButtonEvent event) {
-    return (id < _buttons.size())
-        ? _buttonDecodeEventAction(_buttons[id].actions, event)
+    using namespace espurna::button;
+    return (id < internal::buttons.size())
+        ? decode_actions_event(internal::buttons[id].actions, event)
         : ButtonAction::None;
 }
+
+namespace {
 
 // Note that we don't directly return F(...), but use a temporary to assign it conditionally
 // (ref. https://github.com/esp8266/Arduino/pull/6950 "PROGMEM footprint cleanup for responseCodeToString")
 // In this particular case, saves 76 bytes (120 vs 44)
 
-String _buttonEventString(ButtonEvent event) {
-    const __FlashStringHelper* ptr = nullptr;
+#if DEBUG_SUPPORT || MQTT_SUPPORT
+
+const char* _buttonEventString(ButtonEvent event) {
+    const char* out = "none";
+
     switch (event) {
     case ButtonEvent::Pressed:
-        ptr = F("pressed");
+        out = PSTR("pressed");
         break;
     case ButtonEvent::Released:
-        ptr = F("released");
+        out = PSTR("released");
         break;
     case ButtonEvent::Click:
-        ptr = F("click");
+        out = PSTR("click");
         break;
     case ButtonEvent::DoubleClick:
-        ptr = F("double-click");
+        out = PSTR("double-click");
         break;
     case ButtonEvent::LongClick:
-        ptr = F("long-click");
+        out = PSTR("long-click");
         break;
     case ButtonEvent::LongLongClick:
-        ptr = F("looong-click");
+        out = PSTR("looong-click");
         break;
     case ButtonEvent::TripleClick:
-        ptr = F("triple-click");
+        out = PSTR("triple-click");
         break;
     case ButtonEvent::None:
-        ptr = F("none");
         break;
     }
-    return String(ptr);
+
+    return out;
 }
+
+#endif
+
+} // namespace
 
 void buttonEvent(size_t id, ButtonEvent event) {
 
     DEBUG_MSG_P(PSTR("[BUTTON] Button #%u event %d (%s)\n"),
-        id, _buttonEventNumber(event), _buttonEventString(event).c_str()
+        id, static_cast<int>(event), _buttonEventString(event)
     );
 
     if (event == ButtonEvent::None) {
         return;
     }
 
-    auto& button = _buttons[id];
+    auto& button = espurna::button::internal::buttons[id];
 
-    auto action = _buttonDecodeEventAction(button.actions, event);
+    auto action = espurna::button::decode_actions_event(button.actions, event);
     for (auto& notify : _button_notify_event) {
         notify(id, event);
     }
 
 #if MQTT_SUPPORT
     if ((action != ButtonAction::None) || _buttons_mqtt_send_all[id]) {
-        mqttSend(MQTT_TOPIC_BUTTON, id, _buttonEventString(event).c_str(), false, _buttons_mqtt_retain[id]);
+        mqttSend(MQTT_TOPIC_BUTTON, id, String(_buttonEventString(event)).c_str(), false, _buttons_mqtt_retain[id]);
     }
 #endif
 
     switch (action) {
 
-#if RELAY_SUPPORT
     case ButtonAction::Toggle:
     case ButtonAction::On:
     case ButtonAction::Off:
     case ButtonAction::Pulse:
-        _buttonRelayAction(id, action);
-        break;
+#if RELAY_SUPPORT
+        espurna::button::relay::process_action(id, action);
 #endif
+        break;
 
     case ButtonAction::AccessPoint:
         wifiToggleAp();
         break;
 
     case ButtonAction::Reset:
-        deferredReset(100, CustomResetReason::Button);
+#if SYSTEM_CHECK_ENABLED
+        systemForceStable();
+#endif
+        prepareReset(CustomResetReason::Button);
         break;
 
     case ButtonAction::FactoryReset:
+#if SYSTEM_CHECK_ENABLED
+        systemForceStable();
+#endif
         factoryReset();
         break;
 
@@ -514,6 +1280,11 @@ void buttonEvent(size_t id, ButtonEvent event) {
 #endif
         break;
 
+    case ButtonAction::TerminalCommand:
+#if TERMINAL_SUPPORT
+        espurna::button::terminal::process(id);
+#endif
+
     case ButtonAction::None:
         break;
 
@@ -521,54 +1292,27 @@ void buttonEvent(size_t id, ButtonEvent event) {
 
 }
 
-void _buttonConfigure() {
-    auto buttons = _buttons.size();
+namespace {
 
-#if RELAY_SUPPORT
-    _button_relays.clear();
-#endif
+void _buttonConfigure() {
+    auto buttons = espurna::button::internal::buttons.size();
 
     for (decltype(buttons) id = 0; id < buttons; ++id) {
 #if RELAY_SUPPORT
-        _button_relays.push_back(getSetting({"btnRelay", id}, button::build::relay(id)));
+        espurna::button::relay::add_or_remove(id, espurna::button::settings::relay(id));
 #endif
 #if MQTT_SUPPORT
-        _buttons_mqtt_send_all[id] = getSetting({"btnMqttSendAll", id}, button::build::mqttSendAllEvents(id));
-        _buttons_mqtt_retain[id] = getSetting({"btnMqttRetain", id}, button::build::mqttRetain(id));
+        _buttons_mqtt_send_all[id] = espurna::button::settings::mqttSendAllEvents(id);
+        _buttons_mqtt_retain[id] = espurna::button::settings::mqttRetain(id);
 #endif
     }
 }
 
-// TODO: compatibility proxy, fetch global key before indexed
-unsigned long _buttonGetDelay(const char* key, size_t index, unsigned long default_value) {
-    unsigned long result { default_value };
-
-    bool found { false };
-    auto indexed = SettingsKey(key, index);
-    auto global = String(key);
-
-    settings::kv_store.foreach([&](settings::kvs_type::KeyValueResult&& kv) {
-        if (found) {
-            return;
-        }
-
-        if ((kv.key.length != indexed.length()) && (kv.key.length != global.length())) {
-            return;
-        }
-
-        auto other = kv.key.read();
-        found = indexed == other;
-        if (found || (global == other)) {
-            result = settings::internal::convert<unsigned long>(kv.value.read());
-        }
-    });
-
-    return result;
-}
+} // namespace
 
 void buttonLoop() {
-    for (size_t id = 0; id < _buttons.size(); ++id) {
-        auto event = _buttons[id].loop();
+    for (size_t id = 0; id < espurna::button::internal::buttons.size(); ++id) {
+        auto event = espurna::button::internal::buttons[id].loop();
         if (event != ButtonEvent::None) {
             buttonEvent(id, event);
         }
@@ -582,6 +1326,8 @@ void buttonLoop() {
 // - https://github.com/dxinteractive/AnalogMultiButton
 
 #if BUTTON_PROVIDER_ANALOG_SUPPORT
+
+namespace {
 
 class AnalogPin final : public BasePin {
 public:
@@ -606,7 +1352,7 @@ public:
     String description() const override {
         char buffer[64];
         snprintf_P(buffer, sizeof(buffer),
-            PSTR("%s @ level %d (%d...%d)\n"),
+            PSTR("%s @ level %d (%d...%d)"),
             id(), _expected, _from, _to);
 
         return buffer;
@@ -706,17 +1452,20 @@ private:
 
 std::vector<AnalogPin*> AnalogPin::pins;
 
+} // namespace
+
 #endif // BUTTON_PROVIDER_ANALOG_SUPPORT
+
+namespace {
 
 BasePinPtr _buttonGpioPin(size_t index, ButtonProvider provider) {
     BasePinPtr result;
-
-    auto pin = getSetting({"btnGpio", index}, button::build::pin(index));
+    auto pin [[gnu::unused]] = espurna::button::settings::pin(index);
 
     switch (provider) {
     case ButtonProvider::Gpio: {
 #if BUTTON_PROVIDER_GPIO_SUPPORT
-        auto* base = gpioBase(getSetting({"btnGpioType", index}, button::build::pinType(index)));
+        auto* base = gpioBase(espurna::button::settings::pinType(index));
         if (!base) {
             break;
         }
@@ -725,7 +1474,7 @@ BasePinPtr _buttonGpioPin(size_t index, ButtonProvider provider) {
             break;
         }
 
-        result = std::move(base->pin(pin));
+        result = base->pin(pin);
 #endif
         break;
     }
@@ -736,7 +1485,7 @@ BasePinPtr _buttonGpioPin(size_t index, ButtonProvider provider) {
             break;
         }
 
-        auto level = getSetting({"btnLevel", index}, button::build::analogLevel(index));
+        auto level = espurna::button::settings::analogLevel(index);
         if (!AnalogPin::checkExpectedLevel(level)) {
             break;
         }
@@ -754,32 +1503,53 @@ BasePinPtr _buttonGpioPin(size_t index, ButtonProvider provider) {
 }
 
 ButtonActions _buttonActions(size_t index) {
-    return {
-        getSetting({"btnPress", index}, button::build::press(index)),
-        getSetting({"btnRlse", index}, button::build::release(index)),
-        getSetting({"btnClick", index}, button::build::click(index)),
-        getSetting({"btnDclk", index}, button::build::doubleClick(index)),
-        getSetting({"btnLclk", index}, button::build::longClick(index)),
-        getSetting({"btnLLclk", index}, button::build::longLongClick(index)),
-        getSetting({"btnTclk", index}, button::build::tripleClick(index))
-    };
+  return ButtonActions{
+      .pressed = espurna::button::settings::press(index),
+      .released = espurna::button::settings::release(index),
+      .click = espurna::button::settings::click(index),
+      .dblclick = espurna::button::settings::doubleClick(index),
+      .lngclick = espurna::button::settings::longClick(index),
+      .lnglngclick = espurna::button::settings::longLongClick(index),
+      .trplclick = espurna::button::settings::tripleClick(index)};
 }
 
 // Note that we use settings without indexes as default values to preserve backwards compatibility
 
 ButtonEventDelays _buttonDelays(size_t index) {
-    return {
-        _buttonGetDelay("btnDebDel", index, button::build::debounceDelay(index)),
-        _buttonGetDelay("btnRepDel", index, button::build::repeatDelay(index)),
-        _buttonGetDelay("btnLclkDel", index, button::build::longClickDelay(index)),
-        _buttonGetDelay("btnLLclkDel", index, button::build::longLongClickDelay(index)),
-    };
+    return ButtonEventDelays{
+        .debounce = espurna::button::settings::debounceDelay(index),
+        .repeat = espurna::button::settings::repeatDelay(index),
+        .lngclick = espurna::button::settings::longClickDelay(index),
+        .lnglngclick = espurna::button::settings::longLongClickDelay(index)};
+}
+
+template <typename T>
+void _buttonAdd(T&& button) {
+    espurna::button::internal::buttons.emplace_back(std::forward<T>(button));
+}
+
+espurna::button::Button _buttonWithPin(size_t index, BasePinPtr&& pin) {
+    return espurna::button::Button(
+        std::move(pin),
+        espurna::button::runtime_config(index),
+        _buttonActions(index),
+        _buttonDelays(index));
+}
+
+espurna::button::Button _buttonWithoutPin(size_t index) {
+    return espurna::button::Button(
+            _buttonActions(index),
+            _buttonDelays(index));
 }
 
 bool _buttonSetupProvider(size_t index, ButtonProvider provider) {
     bool result { false };
 
     switch (provider) {
+    case ButtonProvider::Dummy:
+        _buttonAdd(_buttonWithoutPin(index));
+        result = true;
+        break;
 
     case ButtonProvider::Analog:
     case ButtonProvider::Gpio: {
@@ -789,61 +1559,52 @@ bool _buttonSetupProvider(size_t index, ButtonProvider provider) {
             break;
         }
 
-        _buttons.emplace_back(
-            std::move(pin),
-            _buttonRuntimeConfig(index),
-            _buttonActions(index),
-            _buttonDelays(index));
+        _buttonAdd(_buttonWithPin(index, std::move(pin)));
         result = true;
 #endif
         break;
     }
 
+    case ButtonProvider::Lightfox:
+#ifdef FOXEL_LIGHTFOX_DUAL
+        _buttonAdd(_buttonWithPin(index, lightfoxMakeButtonPin(index)));
+        result = true;
+#endif
+        break;
+
     case ButtonProvider::None:
         break;
+
     }
 
     return result;
 }
 
 void _buttonSettingsMigrate(int version) {
-    if (!version || (version >= 5)) {
-        return;
+    if (version < 5) {
+        delSettingPrefix({PSTR("btnGPIO")});
+        moveSetting(F("btnDelay"), F("btnRepDel"));
     }
-
-    delSettingPrefix("btnGPIO");
-    moveSetting("btnDelay", "btnRepDel");
 }
 
+} // namespace
+
 void buttonSetup() {
-    _buttonSettingsMigrate(migrateVersion());
+    migrateVersion(_buttonSettingsMigrate);
+    espurna::button::settings::query::setup();
 
     for (size_t index = 0; index < ButtonsMax; ++index) {
-        auto provider = getSetting({"btnProv", index}, button::build::provider(index));
+        auto provider = espurna::button::settings::provider(index);
         if (!_buttonSetupProvider(index, provider)) {
             break;
         }
     }
 
-    auto count = _buttons.size();
+    auto count = espurna::button::internal::buttons.size();
     DEBUG_MSG_P(PSTR("[BUTTON] Number of buttons: %u\n"), count);
 
 #if TERMINAL_SUPPORT
-    terminalRegisterCommand(F("BUTTON"), [](const terminal::CommandContext& ctx) {
-        unsigned index { 0u };
-        for (auto& button : _buttons) {
-            ctx.output.printf_P(PSTR("%u - "), index++);
-            if (button.event_emitter) {
-                auto& pin = button.event_emitter->pin();
-                ctx.output.print(pin->description());
-            } else {
-                ctx.output.print(F("Virtual"));
-            }
-            ctx.output.print('\n');
-        }
-
-        terminalOK(ctx);
-    });
+    espurna::button::terminal::setup();
 #endif
 
     if (count) {
@@ -858,6 +1619,26 @@ void buttonSetup() {
         espurnaRegisterReload(_buttonConfigure);
 
         espurnaRegisterLoop(buttonLoop);
+    }
+}
+
+void buttonSetupUnstable() {
+#if SYSTEM_CHECK_ENABLED
+    buttonSetup();
+#endif
+
+    for (auto& button : espurna::button::internal::buttons) {
+        const auto mode = button.event_emitter->config().mode;
+        switch (mode) {
+        case debounce_event::types::Mode::Pushbutton:
+            button.actions.click = ButtonAction::Reset;
+            button.actions.dblclick = ButtonAction::AccessPoint;
+            button.actions.lnglngclick = ButtonAction::FactoryReset;
+            break;
+
+        default:
+            break;
+        }
     }
 }
 

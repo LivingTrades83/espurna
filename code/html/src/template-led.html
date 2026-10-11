@@ -1,0 +1,26 @@
+<template id="template-led-config" >
+    <div class="pure-form pure-form-aligned">
+        <fieldset>
+            <legend>LED #<span data-key="template-id"></span></legend>
+            <div class="pure-control-group">
+                <label>GPIO</label>
+                <select class="pure-input-2-3" name="ledGpio" data-action="reboot" data-enumerable="gpio-hardware" required></select>
+            </div>
+            <div class="pure-control-group">
+                <label>Inverse logic</label>
+                <input class="checkbox-toggle" type="checkbox" name="ledInv">
+            </div>
+            <div class="pure-control-group">
+                <label>Mode</label>
+                <select class="pure-input-2-3" name="ledMode" data-enumerable="ledMode" required>
+                    <option disabled selected value=""></option>
+                </select>
+            </div>
+            <div class="module-relay pure-control-group">
+                <label>Relay ID</label>
+                <select class="pure-input-2-3" name="ledRelay" data-enumerable="relay"></select>
+            </div>
+        </fieldset>
+        <button class="pure-button button-del-settings-group more" type="button">Delete LED</button>
+    </div>
+</template>

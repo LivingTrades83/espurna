@@ -1,0 +1,55 @@
+<form id="form-ntp" class="pure-form pure-form-aligned form-settings">
+    <div class="panel" id="panel-ntp">
+
+        <div class="header">
+            <h1>NTP</h1>
+            <h2>Synchronize device time with a remote server</h2>
+        </div>
+
+        <div class="page">
+
+            <fieldset>
+
+                <div class="pure-control-group">
+                    <label>Server</label>
+                    <input name="ntpServer" type="text" placeholder="IP or hostname">
+                </div>
+
+                <div class="pure-control-group">
+                    <label>Time Zone</label>
+                    <input name="ntpTZ" type="text" list="list:ntpTZ" required >
+                    <span class="pure-form-message-inline">POSIX TZ variable, defaults to <code>UTC0</code> aka "Coordinated Universal Time". For example, basic offset is expressed as either <code>UTC2</code> (meaning "UTC minus 2 hours"), or <code>UTC-2</code> ("UTC plus 2 hours"). For the list of possible values based on IANA Time Zone Database, <a href="https://github.com/xoseperez/espurna/wiki/NTP#tz-variable">see our wiki entry.</a></span>
+                    <span class="pure-form-message-inline">For the technical documentation and more complicated examples, <a href="https://www.gnu.org/software/libc/manual/html_node/TZ-Variable.html">see libc tzset(3) manual page</a></span>
+                    <datalist id="list:ntpTZ" data-enumerable="timezones">
+                    </datalist>
+                </div>
+
+                <div class="pure-control-group">
+                    <label>Startup delay</label>
+                    <input name="ntpStartDelay" type="number" min="3" required >
+                    <span class="pure-form-message-inline">
+                        s (seconds)
+                    </span>
+                </div>
+
+                <div class="pure-control-group">
+                    <label>Update interval</label>
+                    <input name="ntpUpdateIntvl" type="number" min="15" required >
+                    <span class="pure-form-message-inline">
+                        s (seconds)
+                    </span>
+                </div>
+
+                <div class="pure-control-group">
+                    <label>DHCP override</label>
+                    <input class="checkbox-toggle" type="checkbox" name="ntpDhcp">
+                    <span class="pure-form-message-inline">
+                        <strong>Always</strong> use NTP server provided by DHCP
+                    </span>
+                </div>
+
+            </fieldset>
+        </div>
+
+    </div>
+</form>

@@ -1,0 +1,217 @@
+/** @import { InputOrSelect } from '../settings.mjs' */
+
+import { parentGroupElements, groupCleanupElements } from './group.elem.mjs';
+import { checkAndSetElementChanged } from './change.mjs';
+import { findInputOrSelect } from './utils.mjs';
+import { getElementName } from './name.mjs';
+import {
+    maybeGetFormId,
+    getOriginalForName,
+    resetDatasetCleanup,
+    resetChangedElement,
+    setDatasetCleanup,
+} from './dataset.mjs';
+
+/**
+ * @param {HTMLElement} elem
+ * @returns {string[]}
+ */
+export function groupElementNames(elem) {
+    return findInputOrSelect(elem)
+        .map(getElementName);
+}
+
+// Right now, group additions happen from:
+// - WebSocket, likely to happen exactly once per connection through processData handler(s). Specific keys trigger functions that append into the container element.
+// - User input. Same functions are triggered, but with an additional event for the container element that causes most recent element to be marked as changed.
+// Removal only happens from user input by triggering 'settings-group-del' from the target element.
+
+/**
+ * @param {HTMLElement | InputOrSelect[]} elem_or_elems
+ * @returns {string[]}
+ */
+function groupCleanupKeys(elem_or_elems) {
+    return groupCleanupElements(elem_or_elems)
+        .map(getElementName);
+}
+
+/**
+ * @param {HTMLElement} group
+ * @param {HTMLElement} target
+ */
+export function groupSettingsAdd(group, target) {
+    /**
+     * @type {(function(InputOrSelect): boolean) | null}
+     * @param {InputOrSelect} elem
+     */
+    let validity = function(elem) {
+        elem.focus();
+        return elem.reportValidity();
+    };
+
+    const elems = findInputOrSelect(target);
+    for (const elem of elems) {
+        if (elem.required && validity && !validity(elem)) {
+            validity = null;
+        }
+
+        checkAndSetElementChanged(elem);
+    }
+
+    const form = group.closest("form");
+    const formId = maybeGetFormId(form);
+
+    groupCleanupKeys(elems)
+        .forEach((key) => {
+            resetDatasetCleanup(formId, key);
+        });
+}
+
+// 'settings-group' contain elements that represent kv list that is suffixed with an index in raw kvs
+// 'button-add-settings-group' will trigger update on the specified 'data-settings-group' element id, which
+// needs to have 'settings-group-add' event handler attached to it.
+
+/**
+ * to 'instantiate' a new element, we must explicitly set 'target' keys in kvs
+ * notice that the 'row' creation *should* be handled by the group-specific
+ * event listener, we already expect the dom element to exist at this point
+ * @param {Event} event
+ */
+function onGroupSettingsEventAdd(event) {
+    const group = event.target;
+    if (!(group instanceof HTMLElement)) {
+        return;
+    }
+
+    const target = group.lastElementChild;
+    if (!(target instanceof HTMLElement)) {
+        return;
+    }
+
+    groupSettingsAdd(group, target);
+}
+
+/**
+ * @param {HTMLElement} group
+ * @param {HTMLElement} target
+ */
+export function groupSettingsDel(group, target) {
+    const form = group.closest("form");
+    const formId = maybeGetFormId(form);
+
+    /** @type {function(string): boolean} */
+    const originalExists =
+        (key) => getOriginalForName(formId, key) !== undefined;
+
+    const last = group.lastElementChild;
+    if (!(last instanceof HTMLElement)) {
+        return;
+    }
+
+    // note that if 'cleanup' class is present, only those names get deleted
+    // rest of the dataset kv remain until page reload, since they are still stored on the device
+    // usually, those get removed by the device itself on reboot (i.e. 'scheduler' gc)
+    const last_elems = findInputOrSelect(last);
+    const cleanup = groupCleanupKeys(last_elems)
+        .filter(originalExists);
+    if (cleanup.length > 0) {
+        setDatasetCleanup(formId, cleanup);
+    }
+
+    findInputOrSelect(target)
+        .map(resetChangedElement);
+    target.remove();
+
+    findInputOrSelect(group)
+        .forEach((elem) => {
+            checkAndSetElementChanged(elem);
+        })
+}
+
+const SETTINGS_GROUP_EVENT_CHANGE = "settings-group-change";
+
+/**
+ * @param {Element} elem
+ */
+export function emitSettingsGroupChange(elem) {
+    elem.dispatchEvent(
+        new CustomEvent(SETTINGS_GROUP_EVENT_CHANGE));
+}
+
+const SETTINGS_GROUP_EVENT_DEL = "settings-group-del";
+
+/**
+ * @param {Event} event
+ */
+export function onGroupSettingsDel(event) {
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) {
+        return;
+    }
+
+    const elements = parentGroupElements(target);
+    if (!(elements instanceof HTMLElement)) {
+        return;
+    }
+
+    elements.dispatchEvent(
+        new CustomEvent(SETTINGS_GROUP_EVENT_DEL, {bubbles: true}));
+}
+
+/**
+ * removing the element means we need to notify the kvs about the updated keys
+ * in case it's the last row, just remove those keys from the store
+ * in case we are in the middle, make sure to handle difference update
+ * in case change was 'ephemeral' (i.e. from the previous add that was not saved), do nothing
+ * @param {Event} event
+ */
+export function onGroupSettingsEventDel(event) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+
+    const target = event.target;
+    if (!(target instanceof HTMLElement)) {
+        return;
+    }
+
+    const group = event.currentTarget;
+    if (!(group instanceof HTMLElement)) {
+        return;
+    }
+
+    groupSettingsDel(group, target);
+}
+
+const SETTINGS_GROUP_EVENT_ADD = "settings-group-add";
+
+/**
+ * @param {HTMLElement} elem
+ * @param {EventListener} listener
+ */
+export function groupSettingsOnAddElem(elem, listener) {
+    elem.addEventListener(SETTINGS_GROUP_EVENT_ADD,
+        (event) => {
+            event.stopPropagation();
+            listener(event);
+            onGroupSettingsEventAdd(event);
+        });
+}
+
+const SETTINGS_GROUP = "settingsGroup";
+
+/**
+ * handle addition to the group using the 'add' button
+ * @param {Event} event
+ */
+export function onGroupSettingsAddClick(event) {
+    const elem = event.target;
+    if (!(elem instanceof HTMLElement)) {
+        return;
+    }
+
+    const id = elem.dataset[SETTINGS_GROUP];
+    if (id) {
+        document.getElementById(id)
+            ?.dispatchEvent(new CustomEvent(SETTINGS_GROUP_EVENT_ADD));
+    }
+}

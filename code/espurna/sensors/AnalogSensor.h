@@ -1,61 +1,83 @@
 // -----------------------------------------------------------------------------
-// Analog Sensor (maps to an analogRead)
+// Analog Sensor
 // Copyright (C) 2017-2019 by Xose Pérez <xose dot perez at gmail dot com>
+//
+// Scaling support by Carlos Iván Conde Martín <ivan dot conde at gmail dot com>
+// (original sensor was just the analogRead output)
 // -----------------------------------------------------------------------------
 
-#if SENSOR_SUPPORT && (ANALOG_SUPPORT || NTC_SUPPORT || LDR_SUPPORT)
-
 #pragma once
+
+#include <algorithm>
+
+#include "../espurna.h"
+#include "../sensor.h"
 
 #include "BaseSensor.h"
 #include "BaseAnalogSensor.h"
 
 class AnalogSensor : public BaseAnalogSensor {
-
     public:
+        static constexpr int RawBits { 10 };
 
-        // ---------------------------------------------------------------------
-        // Public
-        // ---------------------------------------------------------------------
+        static constexpr double RawMin { 0.0 };
+        static constexpr double RawMax { (1 << RawBits) - 1 };
 
-        AnalogSensor() {
-            _count = 1;
-            _sensor_id = SENSOR_ANALOG_ID;
+        static constexpr size_t SamplesMin { 1 };
+        static constexpr size_t SamplesMax { 16 };
+
+        using Microseconds = espurna::duration::critical::Microseconds;
+
+        static constexpr auto DelayMin = Microseconds{ 200 };
+        static constexpr auto DelayMax = Microseconds::max();
+
+        unsigned char id() const override {
+            return SENSOR_ANALOG_ID;
         }
 
-        void setSamples(unsigned int samples) {
-            if (_samples > 0) _samples = samples;
+        unsigned char count() const override {
+            return 1;
         }
 
-        void setDelay(unsigned long micros) {
-            _micros = micros;
+        void setDelay(Microseconds delay) {
+            _delay = std::clamp(delay, DelayMin, DelayMax);
+        }
+
+        void setDelay(uint16_t delay) {
+            setDelay(Microseconds{delay});
+        }
+
+        void setSamples(size_t samples) {
+            _samples = std::clamp(samples, SamplesMin, SamplesMax);
         }
 
         void setFactor(double factor) {
-            //DEBUG_MSG(("[ANALOG_SENSOR] Factor set to: %s \n"), String(factor,6).c_str());
             _factor = factor;
         }
 
         void setOffset(double offset) {
-          //DEBUG_MSG(("[ANALOG_SENSOR] Factor set to: %s \n"), String(offset,6).c_str());
             _offset = offset;
+        }
+
+        void setPin(uint8_t pin) {
+            _pin = pin;
         }
 
         // ---------------------------------------------------------------------
 
-        unsigned int getSamples() {
+        size_t getSamples() const {
             return _samples;
         }
 
-        unsigned long getDelay() {
-            return _micros;
+        Microseconds getDelay() const {
+            return _delay;
         }
 
-        double getFactor() {
+        double getFactor() const {
             return _factor;
         }
 
-        double getOffset() {
+        double getOffset() const {
             return _offset;
         }
 
@@ -64,75 +86,117 @@ class AnalogSensor : public BaseAnalogSensor {
         // ---------------------------------------------------------------------
 
         // Initialization method, must be idempotent
-        void begin() {
+        void begin() override {
             _ready = true;
+            _last = TimeSource::now() + _delay;
         }
 
         // Descriptive name of the sensor
-        String description() {
-            return String("ANALOG @ TOUT");
+        String description() const override {
+            return F("ANALOG @ TOUT");
         }
 
-        // Descriptive name of the slot # index
-        String description(unsigned char index) {
-            return description();
-        };
-
         // Address of the sensor (it could be the GPIO or I2C address)
-        String address(unsigned char index) {
-            return String("0");
+        String address(unsigned char) const override {
+            return F("A0");
         }
 
         // Type for slot # index
-        unsigned char type(unsigned char index) {
-            if (index == 0) return MAGNITUDE_ANALOG;
+        unsigned char type(unsigned char index) const override {
+            if (index == 0) {
+                return MAGNITUDE_ANALOG;
+            }
+
             return MAGNITUDE_NONE;
         }
 
         // Current value for slot # index
-        // Changed return type as moving to scaled value
-        double value(unsigned char index) {
-            if (index == 0) return _read();
+        double value(unsigned char index) override {
+            if (index == 0) {
+                return _sampledValue();
+            }
+
             return 0;
         }
 
+        void tick() override {
+            _readNext(_pin);
+        }
+
     protected:
+        double _sampledVoltageValue() const {
+            return _value / RawMax;
+        }
 
-        //CICM: this should be for raw values
-        // renaming protected function "_read" to "_rawRead"
-        unsigned int _rawRead() {
-            if (1 == _samples) return analogRead(0);
-            unsigned long sum = 0;
-            for (unsigned int i=0; i<_samples; i++) {
-                if (i>0) delayMicroseconds(_micros);
-                sum += analogRead(0);
+        double _sampledValue() const {
+            return _value;
+        }
+
+        void _sampledValue(double value) {
+            _value = value;
+        }
+
+        void _readNext(uint8_t pin) {
+            if (_sample >= _samples) {
+                return;
             }
-            return sum / _samples;
+
+            const auto now = TimeSource::now();
+            if (now - _last < _delay) {
+                return;
+            }
+
+            ++_sample;
+            _last = now;
+            _sum += ::analogRead(pin);
+
+            if (_sample >= _samples) {
+                const double sum = _sum;
+                const double samples = _samples;
+                _sampledValue(sum / samples);
+                _sum = 0;
+                _sample = 0;
+            }
         }
 
-        //CICM: and proper read should be scalable and thus needs sign
-        //and decimal part
-        double _read() {
-          //Raw measure could also be a class variable with getter so that can
-          //be reported through MQTT, ...
-          unsigned int rawValue;
-          double scaledValue;
-          // Debugging doubles to string
-          //DEBUG_MSG(("[ANALOG_SENSOR] Started standard read, factor: %s , offset: %s, decimals: %d \n"), String(_factor).c_str(), String(_offset).c_str(), ANALOG_DECIMALS);
-          rawValue = _rawRead();
-          //DEBUG_MSG(("[ANALOG_SENSOR] Raw read received: %d \n"), rawValue);
-          scaledValue = _factor*rawValue  + _offset;
-          //DEBUG_MSG(("[ANALOG_SENSOR] Scaled value result: %s \n"), String(scaledValue).c_str());
-          return scaledValue;
+        double _withFactor(double value) const {
+            return _factor * value + _offset;
         }
 
+        double _minWithFactor() const {
+            return _withFactor(RawMin);
+        }
 
-        unsigned int _samples = 1;
-        unsigned long _micros = 0;
-        //CICM: for scaling and offset, also with getters and setters
-        double _factor = 1.0;
-        double _offset = 0.0;
+        double _maxWithFactor() const {
+            return _withFactor(RawMax);
+        }
 
+        using TimeSource = espurna::time::CpuClock;
+        TimeSource::time_point _last{};
+        Microseconds _delay { DelayMin };
+
+        size_t _samples { SamplesMin };
+        size_t _sample { 0 };
+
+        uint32_t _sum { 0 };
+
+        double _value { 0.0 };
+
+        double _factor { 1.0 };
+        double _offset { 0.0 };
+
+        uint8_t _pin { A0 };
 };
 
-#endif // SENSOR_SUPPORT && ANALOG_SUPPORT
+#ifndef __cpp_inline_variables
+constexpr int AnalogSensor::RawBits;
+
+constexpr double AnalogSensor::RawMin;
+constexpr double AnalogSensor::RawMax;
+
+constexpr size_t AnalogSensor::SamplesMin;
+constexpr size_t AnalogSensor::SamplesMax;
+
+constexpr AnalogSensor::Microseconds AnalogSensor::DelayMin;
+constexpr AnalogSensor::Microseconds AnalogSensor::DelayMax;
+#endif

@@ -13,23 +13,28 @@ class AnimComets : public Anim {
     }
 
     void SetupImpl() override {
-        comets.clear();
-        for (int i = 0; i < 4; ++i)
-            comets.emplace_back(palette, numLeds);
+        if (comets.size()) {
+            for (auto& c : comets) {
+                c = {palette, numLeds};
+            }
+        } else {
+            for (auto i = 0; i < 5; ++i) {
+                comets.emplace_back(palette, numLeds);
+            }
+        }
     }
 
     void Run() override {
-        for (int i = 0; i < numLeds; ++i) leds[i] = 0;
+        for (auto i = 0; i < numLeds; ++i) leds[i] = 0;
 
         for (auto& c : comets) {
             int tail = c.head + c.len * -c.dir;
             // Check if Comet out of range and generate it again
             if ((c.head < 0 && tail < 0) || (c.head >= numLeds && tail >= numLeds)) {
-                Comet new_comet(palette, numLeds);
-                std::swap(c, new_comet);
+                c = {palette, numLeds};
             }
 
-            for (int l = 0; l < c.len; ++l) {
+            for (auto l = 0; l < c.len; ++l) {
                 int p = c.head + l * -c.dir;
                 if (p >= 0 && p < numLeds) {
                     leds[p] = c.points[l];
@@ -41,21 +46,21 @@ class AnimComets : public Anim {
 
    private:
     struct Comet {
+        int dir = randDir();
+        int len = secureRandom(10, 30);
+        float speed = ((float)secureRandom(4, 20)) / 10;
         float head;
-        int len = secureRandom(10, 20);
-        float speed = ((float)secureRandom(4, 10)) / 10;
         Color color;
-        int dir = 1;
-        std::vector<Color> points;
-        Comet(Palette* pal, uint16_t numLeds) : head(secureRandom(0, numLeds / 2)), color(pal->getRndInterpColor()), points(len) {
+        std::unique_ptr<Color[]> points;
+        Comet(Palette* pal, uint16_t numLeds) : head(dir > 0 ? secureRandom(0, numLeds / 2) : secureRandom(numLeds / 2, numLeds)), color(pal->getRndInterpColor()) {
             // DEBUG_MSG_P(PSTR("[GARLAND] Comet created head = %d len = %d speed = %g cr = %d cg = %d cb = %d\n"), head, len, speed, color.r, color.g, color.b);
-            if (secureRandom(10) > 5) {
-                head = numLeds - head;
-                dir = -1;
-            }
 
-            for (int i = 0; i < len; ++i) {
-                points[i] = Color((byte)(color.r * (len - i) / len), (byte)(color.g * (len - i) / len), (byte)(color.b * (len - i) / len));
+            points.reset(new Color[len]);
+            for (auto i = 0; i < len; ++i) {
+                points[i] = {
+                    (byte)(color.r * (len - i) / len),
+                    (byte)(color.g * (len - i) / len),
+                    (byte)(color.b * (len - i) / len)};
             }
         }
     };

@@ -1,0 +1,11 @@
+#define LIGHT_PROVIDER LIGHT_PROVIDER_DIMMER
+#define LIGHT_CH1_PIN 5
+#define LIGHT_CH2_PIN 4
+#define LIGHT_CH3_PIN 12
+#define LIGHT_CH4_PIN 13
+#define LIGHT_CH5_PIN 14
+#define ENCODER_SUPPORT 1
+#define IR_SUPPORT 1
+#define IR_RX_PIN  4
+#define IR_RX_PRESET 1
+#define IR_TX_PIN  5

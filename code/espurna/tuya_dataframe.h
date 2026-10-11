@@ -83,7 +83,7 @@ public:
     uint8_t operator[](size_t i) const {
         return *(_begin + i);
     }
-     
+
     uint8_t version() const {
         return _version;
     }
@@ -129,8 +129,8 @@ public:
     {}
 
     explicit DataFrame(const Transport& input) :
-        _version(input[2]),
-        _command(input[3])
+        _command(input[3]),
+        _version(input[2])
     {
         auto length = (input[4] << 8) + input[5];
         _data.reserve(length);
@@ -141,8 +141,8 @@ public:
 
     explicit DataFrame(const DataFrameView& view) :
         _data(view.cbegin(), view.cend()),
-        _version(view.version()),
-        _command(view.command())
+        _command(view.command()),
+        _version(view.version())
     {}
 
     const container& data() const {
@@ -180,8 +180,8 @@ public:
 private:
     container _data;
 
-    uint8_t _version { 0u };
     uint8_t _command { 0u };
+    uint8_t _version { 0u };
 };
 
 } // namespace

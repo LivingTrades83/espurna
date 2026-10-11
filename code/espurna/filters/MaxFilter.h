@@ -1,40 +1,47 @@
 // -----------------------------------------------------------------------------
 // Max Filter
 // Copyright (C) 2017-2019 by Xose Pérez <xose dot perez at gmail dot com>
+// Copyright (C) 2023-2024 by Maxim Prokhorov <prokhorov dot max at outlook dot com>
 // -----------------------------------------------------------------------------
-
-#if SENSOR_SUPPORT
 
 #pragma once
 
 #include "BaseFilter.h"
 
+#include <algorithm>
+
 class MaxFilter : public BaseFilter {
-
-    public:
-
-        void add(double value) {
-            if (value > _max) _max = value;
+public:
+    void update(double value) override {
+        if (!_status) {
+            _value = value;
+        } else {
+            _value = std::max(value, _value);
         }
+        _status = true;
+    }
 
-        unsigned char count() {
-            return 1;
-        }
+    bool available() const override {
+        return _status;
+    }
 
-        void reset() {
-            _max = 0;
-        }
+    bool ready() const override {
+        return _status;
+    }
 
-        double result() {
-            return _max;
-        }
+    void reset() override {
+        _status = false;
+    }
 
-        void resize(unsigned char size) {}
+    void restart() override {
+        _status = false;
+    }
 
-    protected:
+    double value() const override {
+        return _value;
+    }
 
-        double _max = 0;
-
+private:
+    double _value { 0 };
+    bool _status { false };
 };
-
-#endif // SENSOR_SUPPORT

@@ -1,0 +1,26 @@
+{
+  "include": [
+      "lib/*",
+      "src/*"
+  ],
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "declaration": true,
+    "declarationMap": true,
+    "emitDeclarationOnly": true,
+    "module": "es2022",
+    "moduleResolution": "nodenext",
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "strict": true,
+    "target": "es2022",
+    "types": ["dom"],
+    "paths": {
+      "@build-preset/*": ["./preset/dev/*"]
+    }
+  },
+  "exclude": [
+    "node_modules"
+  ]
+}

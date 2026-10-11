@@ -3,38 +3,47 @@
 // Copyright (C) 2017-2019 by Xose Pérez <xose dot perez at gmail dot com>
 // -----------------------------------------------------------------------------
 
-#if SENSOR_SUPPORT
-
 #pragma once
 
 #include "BaseFilter.h"
 
 class SumFilter : public BaseFilter {
-
-    public:
-
-        void add(double value) {
+public:
+    void update(double value) override {
+        if (!_status) {
+            _value = value;
+        } else {
             _value += value;
         }
 
-        unsigned char count() {
-            return 1;
-        }
+        _status = true;
+    }
 
-        void reset() {
-            _value = 0.0;
-        }
+    bool ready() const override {
+        return _status;
+    }
 
-        double result() {
-            return _value;
-        }
+    bool available() const override {
+        return _status;
+    }
 
-        void resize(unsigned char size) {}
+    void reset() override {
+        _reset();
+    }
 
-    protected:
+    void restart() override {
+        _reset();
+    }
 
-        double _value = 0;
+    double value() const override {
+        return _value;
+    }
 
+private:
+    void _reset() {
+        _status = false;
+    }
+
+    double _value { 0.0 };
+    bool _status { false };
 };
-
-#endif // SENSOR_SUPPORT

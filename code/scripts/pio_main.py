@@ -9,24 +9,36 @@
 
 # Run this script every time building an env AFTER platform-specific code is loaded
 
+import os
+import itertools
+
 from espurna_utils import (
-    check_printsize,
-    remove_float_support,
-    ldscripts_inject_libpath,
-    app_inject_revision,
-    dummy_ets_printf,
+    app_add_compiledb_defines,
+    app_add_gzip_file,
+    app_add_target_build_and_copy,
     app_inject_flags,
-    copy_release,
+    app_inject_version,
+    app_patch_elf2bin,
+    app_patch_cachedir,
+    check_binsize,
+    check_env,
+    disable_postmortem_output,
+    ldscripts_inject_libpath,
+    remove_float_support,
 )
 
+from SCons.Script import Import
 
 Import("env", "projenv")
+env = globals()["env"]
+projenv = globals()["projenv"]
 
-import os
+CI = check_env("CI", "false")
 
-CI = "true" == os.environ.get("CI")
-
-env.ProcessFlags("-Wl,-Map -Wl,\\\"${BUILD_DIR}/${PROGNAME}.map\\\"")
+# See what happens in-between linking .cpp.o + .a into the resulting .elf
+env.Append(ESPURNA_BUILD_FIRMWARE_MAP="${BUILD_DIR}/${PROGNAME}.map")
+env.Append(LINKFLAGS="-Wl,-Map -Wl,$ESPURNA_BUILD_FIRMWARE_MAP -Wl,--cref")
+env.SideEffect(env["ESPURNA_BUILD_FIRMWARE_MAP"], "${BUILD_DIR}/${PROGNAME}.elf")
 
 # Always show warnings for project code
 projenv.ProcessUnFlags("-w")
@@ -36,21 +48,59 @@ projenv.ProcessUnFlags("-w")
 remove_float_support(env)
 ldscripts_inject_libpath(env)
 
-# two-step update hint when using 1MB boards
-if not CI:
-    env.AddPostAction("$BUILD_DIR/${PROGNAME}.bin", check_printsize)
-
-# disable postmortem printing to the uart. another one is in eboot, but this is what causes the most harm
-if "DISABLE_POSTMORTEM_STACKDUMP" in env["CPPFLAGS"]:
+# compressed and two-step update hint when using 1MB boards
+if not CI and env.get("UPLOAD_PROTOCOL") == "espota":
     env.AddPostAction(
-        "$BUILD_DIR/FrameworkArduino/core_esp8266_postmortem.cpp.o", dummy_ets_printf
+        "${BUILD_DIR}/${PROGNAME}.bin",
+        env.VerboseAction(check_binsize, "Checking maximum upload size $TARGET"),
     )
 
-# when using git, add -DAPP_REVISION=(git-commit-hash)
-app_inject_revision(projenv)
+# disable postmortem printing to the uart. another one is in eboot, but this is what causes the most harm
+if "DISABLE_POSTMORTEM_STACKDUMP" in itertools.chain(
+    env["CPPFLAGS"], projenv["CPPFLAGS"]
+):
+    disable_postmortem_output(env)
 
-# handle OTA board and flags here, since projenv is not available in pre-scripts
+# override static version flag from the espurna/config/version.h
+# either completely, or change the version / revision / suffix part separately
+app_inject_version(projenv)
+
+# handle ESPURNA_BOARD and ESPURNA_FLAGS here, since projenv is not available in pre-scripts
+# TODO: prefer PLATFORMIO_BUILD_SRC_FLAGS instead? both of these only allow -D...
 app_inject_flags(projenv)
 
-# handle `-t release` when CI does a tagged build
-env.AlwaysBuild(env.Alias("release", "${BUILD_DIR}/${PROGNAME}.bin", copy_release))
+# handle when CI does a tagged build or user explicitly asked to store the firmware.bin
+app_add_target_build_and_copy(projenv)
+
+# handle special GzipFile builder
+app_add_gzip_file(projenv)
+
+# pre-processing single-source only makes sense from projenv
+# (however, this means dependencies are already attached)
+single_source = env.get("ESPURNA_SINGLE_SOURCE_TARGET")
+if single_source:
+    projenv.AddCustomTarget(
+        "dependencies",
+        [
+            projenv.PreProcess(single_source),
+            projenv.SourceDep(single_source),
+        ],
+        None,
+        title="Intermediate dependency files",
+        description=None,
+        always_build=False,
+    )
+
+# hijack SCons signature generation to exclude BUILD_DIR, making our builds faster
+# when using different environments (i.e. itead-sonoff-basic, itead-sonoff-pow, etc.)
+cachedir_fix = check_env("ESPURNA_FIX_CACHEDIR_PATH", "n")
+if cachedir_fix:
+    app_patch_cachedir(projenv)
+
+# workaround for Core 2.7.4 python3.12 syntax warnings, merge upstream changes
+app_patch_elf2bin(env)
+
+# modules are implicitly enabled when generating compile_commands.json
+# disabled by default, to avoid silently hijacking config values from headers
+if check_env("ESPURNA_COMPILEDB_DEFINES", "0"):
+    app_add_compiledb_defines(projenv)

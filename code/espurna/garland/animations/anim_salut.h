@@ -13,20 +13,23 @@ class AnimSalut : public Anim {
     }
 
     void SetupImpl() override {
-        shots.clear();
         // There can be more then one shot at the moment
-        // but looks like one is enough
-        // for (int i = 0; i < 3; ++i)
+        // but looks like one is enough for now
+        if (shots.size()) {
+            for (auto& s : shots) {
+                s = {palette, numLeds};
+            }
+        } else {
             shots.emplace_back(palette, numLeds);
+        }
     }
 
     void Run() override {
-        for (int i = 0; i < numLeds; ++i) leds[i] = 0;
+        for (auto i = 0; i < numLeds; ++i) leds[i] = 0;
 
         for (auto& c : shots) {
             if (!c.Run(leds)) {
-                Shot new_shot(palette, numLeds);
-                std::swap(c, new_shot);
+                c = Shot(palette, numLeds);
             }
         }
     }
@@ -39,10 +42,11 @@ class AnimSalut : public Anim {
             float speed = ((float)secureRandom(1, 25)) / 10;
             float speed_dec = ((float)secureRandom(1, 3)) / 10;
             float pos;
-            int dir;
+            int dir = randDir();
             Color color;
             uint16_t numLeds;
-            Spark(int pos, Palette* pal, uint16_t numLeds) : pos(pos), dir(secureRandom(10) > 5 ? -1 : 1), color(pal->getRndInterpColor()), numLeds(numLeds) {}
+            Spark() = default;
+            Spark(int pos, Palette* pal, uint16_t numLeds) : pos(pos), color(pal->getRndInterpColor()), numLeds(numLeds) {}
             void Run(Color* leds) {
                 if (pos >= 0 && pos < numLeds) {
                     leds[(int)pos] = color;
@@ -51,7 +55,7 @@ class AnimSalut : public Anim {
                         speed -= speed_dec;
                     } else {
                         color.fade(5);
-                        if (color.empty()) {
+                        if (color.is_empty()) {
                             if (secureRandom(10) > 8)
                                 leds[(int)pos] = 0xFFFFFF;
                             done = true;
@@ -65,21 +69,21 @@ class AnimSalut : public Anim {
 
        public:
         int spark_num = secureRandom(30, 40);
-        int center;
-        std::vector<Spark> sparks;
-        Shot(Palette* pal, uint16_t numLeds) : center(secureRandom(15, numLeds - 15)) {
+        std::unique_ptr<Spark[]> sparks;
+        Shot(Palette* pal, uint16_t numLeds) {
             // DEBUG_MSG_P(PSTR("[GARLAND] Shot created center = %d spark_num = %d\n"), center, spark_num);
-            sparks.reserve(spark_num);
-            for (int i = 0; i < spark_num; ++i) {
-                sparks.emplace_back(center, pal, numLeds);
+            int center = secureRandom(15, numLeds - 15);
+            sparks.reset(new Spark[spark_num]);
+            for (auto i = 0; i < spark_num; ++i) {
+                sparks[i] = {center, pal, numLeds};
             }
         }
         bool Run(Color* leds) {
             bool done = true;
-            for (auto& s : sparks) {
-                if (!s.done) {
+            for (auto i = 0; i < spark_num; ++i) {
+                if (!sparks[i].done) {
                     done = false;
-                    s.Run(leds);
+                    sparks[i].Run(leds);
                 }
             }
             return !done;

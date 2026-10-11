@@ -6,15 +6,16 @@ Copyright (C) 2017 by Dmitry Blinov <dblinov76 at gmail dot com>
 
 */
 
-#include "thermostat.h"
+#include "espurna.h"
 
 #if THERMOSTAT_SUPPORT
 
+#include "mqtt.h"
 #include "ntp.h"
 #include "ntp_timelib.h"
 #include "relay.h"
 #include "sensor.h"
-#include "mqtt.h"
+#include "thermostat.h"
 #include "ws.h"
 
 #include <ArduinoJson.h>
@@ -77,7 +78,7 @@ temp_range_t _temp_range;
 thermostat_t _thermostat;
 
 enum thermostat_cycle_type {cooling, heating};
-unsigned int _thermostat_cycle = heating;
+unsigned int _thermostat_cycle = _thermostat_mode_cooler ? heating : cooling;
 String thermostat_remote_sensor_topic;
 
 //------------------------------------------------------------------------------
@@ -120,34 +121,37 @@ void thermostatRegister(thermostat_callback_f callback) {
 //------------------------------------------------------------------------------
 void updateRemoteTemp(bool remote_temp_actual) {
   #if WEB_SUPPORT
-      char tmp_str[16];
+      String out("?");
+
       if (remote_temp_actual) {
-        dtostrf(_remote_temp.temp, 1, 1, tmp_str);
-      } else {
-        strcpy(tmp_str, "\"?\"");
+        char tmp[33] {0};
+        dtostrf(_remote_temp.temp, 1, 1, tmp);
+        out = tmp;
       }
-      char buffer[128];
-      snprintf_P(buffer, sizeof(buffer), PSTR("{\"thermostatVisible\": 1, \"remoteTmp\": %s}"), tmp_str);
-      wsSend(buffer);
+
+      wsPost([out](JsonObject& root) {
+        root["remoteTmp"] = out;
+      });
   #endif
 }
 
 //------------------------------------------------------------------------------
 void updateOperationMode() {
   #if WEB_SUPPORT
-    String message(F("{\"thermostatVisible\": 1, \"thermostatOperationMode\": \""));
+    String message;
     if (_thermostat.temperature_source == temp_remote) {
-      message += F("remote temperature");
+      message = F("remote temperature");
       updateRemoteTemp(true);
     } else if (_thermostat.temperature_source == temp_local) {
-      message += F("local temperature");
+      message = F("local temperature");
       updateRemoteTemp(false);
     } else {
-      message += F("autonomous");
+      message = F("autonomous");
       updateRemoteTemp(false);
     }
-    message += F("\"}");
-    wsSend(message.c_str());
+    wsPost([message](JsonObject& root) {
+      root[NAME_OPERATION_MODE] = message;
+    });
   #endif
 }
 
@@ -155,14 +159,14 @@ void updateOperationMode() {
 // MQTT
 //------------------------------------------------------------------------------
 
-bool _thermostatMqttHeartbeat(heartbeat::Mask mask) {
-    if (mask & heartbeat::Report::Range) {
+bool _thermostatMqttHeartbeat(espurna::heartbeat::Mask mask) {
+    if (mask & espurna::heartbeat::Report::Range) {
         const auto& range = thermostatRange();
         mqttSend(MQTT_TOPIC_HOLD_TEMP "_" MQTT_TOPIC_HOLD_TEMP_MIN, String(range.min).c_str());
         mqttSend(MQTT_TOPIC_HOLD_TEMP "_" MQTT_TOPIC_HOLD_TEMP_MAX, String(range.max).c_str());
     }
 
-    if (mask & heartbeat::Report::RemoteTemp) {
+    if (mask & espurna::heartbeat::Report::RemoteTemp) {
         const auto& remote_temp = thermostatRemoteTemp();
         char buffer[16];
         dtostrf(remote_temp.temp, 1, 1, buffer);
@@ -172,7 +176,7 @@ bool _thermostatMqttHeartbeat(heartbeat::Mask mask) {
     return mqttConnected();
 }
 
-void thermostatMqttCallback(unsigned int type, const char * topic, const char * payload) {
+void thermostatMqttCallback(unsigned int type, espurna::StringView topic, espurna::StringView payload) {
 
     if (type == MQTT_CONNECT_EVENT) {
       mqttSubscribeRaw(thermostat_remote_sensor_topic.c_str());
@@ -180,26 +184,25 @@ void thermostatMqttCallback(unsigned int type, const char * topic, const char * 
     }
 
     if (type == MQTT_MESSAGE_EVENT) {
-
-        // Match topic
-        String t = mqttMagnitude((char *) topic);
-
-        if (strcmp(topic, thermostat_remote_sensor_topic.c_str()) != 0
-         && !t.equals(MQTT_TOPIC_HOLD_TEMP))
+        auto t = mqttMagnitude(topic);
+        if ((topic != thermostat_remote_sensor_topic)
+            && !t.equals(MQTT_TOPIC_HOLD_TEMP))
+        {
            return;
+        }
 
-        // Parse JSON input
         DynamicJsonBuffer jsonBuffer;
-        JsonObject& root = jsonBuffer.parseObject(payload);
+        JsonObject& root = jsonBuffer.parseObject(payload.begin());
         if (!root.success()) {
             DEBUG_MSG_P(PSTR("[THERMOSTAT] Error parsing data\n"));
             return;
         }
 
-        // Check rempte sensor temperature
-        if (strcmp(topic, thermostat_remote_sensor_topic.c_str()) == 0) {
-            if (root.containsKey(magnitudeTopic(MAGNITUDE_TEMPERATURE))) {
-                String remote_temp = root[magnitudeTopic(MAGNITUDE_TEMPERATURE)];
+        // Check remote sensor temperature
+        if (topic == thermostat_remote_sensor_topic) {
+            const auto key = magnitudeTypeTopic(MAGNITUDE_TEMPERATURE);
+            if (root.containsKey(key)) {
+                String remote_temp = root[key];
                 _remote_temp.temp = remote_temp.toFloat();
                 _remote_temp.last_update = millis();
                 _remote_temp.need_display_update = true;
@@ -229,11 +232,13 @@ void thermostatMqttCallback(unsigned int type, const char * topic, const char * 
 
                 DEBUG_MSG_P(PSTR("[THERMOSTAT] Hold temperature range: (%d - %d)\n"), _temp_range.min, _temp_range.max);
                 // Update websocket clients
-                #if WEB_SUPPORT
-                    char buffer[100];
-                    snprintf_P(buffer, sizeof(buffer), PSTR("{\"thermostatVisible\": 1, \"tempRangeMin\": %d, \"tempRangeMax\": %d}"), _temp_range.min, _temp_range.max);
-                    wsSend(buffer);
-                #endif
+#if WEB_SUPPORT
+                auto range = _temp_range;
+                wsPost([range](JsonObject& root) {
+                    root["tempRangeMin"] = range.min;
+                    root["tempRangeMax"] = range.max;
+                });
+#endif
             } else {
                 DEBUG_MSG_P(PSTR("[THERMOSTAT] Error temperature range data\n"));
             }
@@ -259,7 +264,7 @@ void commonSetup() {
 
   _thermostat_mode_cooler = getSetting(NAME_THERMOSTAT_MODE, THERMOSTAT_MODE_COOLER_BY_DEFAULT);
   DEBUG_MSG_P(PSTR("[THERMOSTAT] _thermostat_mode_cooler = %d\n"), _thermostat_mode_cooler);
-  
+
   _temp_range.min         = getSetting(NAME_TEMP_RANGE_MIN, THERMOSTAT_TEMP_RANGE_MIN);
   _temp_range.max         = getSetting(NAME_TEMP_RANGE_MAX, THERMOSTAT_TEMP_RANGE_MAX);
   DEBUG_MSG_P(PSTR("[THERMOSTAT] _temp_range.min = %d\n"), _temp_range.min);
@@ -281,7 +286,7 @@ void _thermostatReload() {
   int prev_temp_range_max = _temp_range.max;
 
   commonSetup();
- 
+
   if (_temp_range.min != prev_temp_range_min)
     notifyRangeChanged(true);
   if (_temp_range.max != prev_temp_range_max)
@@ -297,7 +302,7 @@ void sendTempRangeRequest() {
 //------------------------------------------------------------------------------
 void setThermostatState(bool state) {
   DEBUG_MSG_P(PSTR("[THERMOSTAT] setThermostatState: %s\n"), state ? "ON" : "OFF");
-  relayStatus(THERMOSTAT_RELAY, state, mqttForward(), false);
+  relayStatus(THERMOSTAT_RELAY, state);
   _thermostat.last_switch = millis();
   // Send thermostat change state event to subscribers
   for (unsigned char i = 0; i < _thermostat_callbacks.size(); i++) {
@@ -306,11 +311,10 @@ void setThermostatState(bool state) {
 }
 
 //------------------------------------------------------------------------------
-void debugPrintSwitch(bool state, double temp) {
-  char tmp_str[16];
-  dtostrf(temp, 1, 1, tmp_str);
-  DEBUG_MSG_P(PSTR("[THERMOSTAT] switch %s, temp: %s, min: %d, max: %d, mode: %s, relay: %s, last switch %d\n"),
-   state ? "ON" : "OFF", tmp_str, _temp_range.min, _temp_range.max, _thermostat_mode_cooler ? "COOLER" : "HEATER", relayStatus(THERMOSTAT_RELAY) ? "ON" : "OFF", millis() - _thermostat.last_switch);
+void debugPrintSwitch(bool state, const char* tmp_str, const char* reason) {
+  DEBUG_MSG_P(PSTR("[THERMOSTAT] switch %s, temp: %s, min: %d, max: %d, mode: %s, relay: %s, last switch %d, reason: %s\n"),
+   state ? "ON" : "OFF", tmp_str, _temp_range.min, _temp_range.max, _thermostat_mode_cooler ? "COOLER" : "HEATER",
+   relayStatus(THERMOSTAT_RELAY) == RelayStatus::On ? "ON" : "OFF", millis() - _thermostat.last_switch, reason);
 }
 
 //------------------------------------------------------------------------------
@@ -319,59 +323,54 @@ inline bool lastSwitchEarlierThan(unsigned int comparing_time) {
 }
 
 //------------------------------------------------------------------------------
-inline void switchThermostat(bool state, double temp) {
-    debugPrintSwitch(state, temp);
+inline void switchThermostat(bool state, const char* tmp_str, const char* reason) {
+    debugPrintSwitch(state, tmp_str, reason);
     setThermostatState(state);
 }
 
 //------------------------------------------------------------------------------
-//----------- Main function that make decision ---------------------------------
+//----------- Main function that make decision and relay controling ------------
 //------------------------------------------------------------------------------
 void checkTempAndAdjustRelay(double temp) {
-  if (_thermostat_mode_cooler == false) { // Main operation mode. Thermostat is HEATER.
-    // if thermostat switched ON and t > max - switch it OFF and start cooling
-    if (relayStatus(THERMOSTAT_RELAY) && temp > _temp_range.max) {
-      _thermostat_cycle = cooling;
-      switchThermostat(false, temp);
-    // if thermostat switched ON for max time - switch it OFF for rest
-    } else if (relayStatus(THERMOSTAT_RELAY) && lastSwitchEarlierThan(_thermostat_max_on_time)) {
-      switchThermostat(false, temp);
-    // if t < min and thermostat switched OFF for at least minimum time - switch it ON and start
-    } else if (!relayStatus(THERMOSTAT_RELAY) && temp < _temp_range.min
-        && (_thermostat.last_switch == 0 || lastSwitchEarlierThan(_thermostat_min_off_time))) {
-      _thermostat_cycle = heating;
-      switchThermostat(true, temp);
-    // if heating cycle and thermostat switchaed OFF for more than min time - switch it ON
-    // continue heating cycle
-    } else if (!relayStatus(THERMOSTAT_RELAY) && _thermostat_cycle == heating
-        && lastSwitchEarlierThan(_thermostat_min_off_time)) {
-      switchThermostat(true, temp);
+  char tmp_str[16];
+  dtostrf(temp, 1, 1, tmp_str);
+  // if t < min - start heating cycle
+  if (_thermostat_cycle == cooling && temp < _temp_range.min) {
+    DEBUG_MSG_P(PSTR("[THERMOSTAT] starting HEATING cycle because the temperature %s dropped below minimum %d\n"), tmp_str, _temp_range.min);
+    _thermostat_cycle = heating;
+    // if t > max - start cooling cycle
+  } else if (_thermostat_cycle == heating && temp > _temp_range.max) {
+    DEBUG_MSG_P(PSTR("[THERMOSTAT] starting COOLING cycle because the temperature %s has risen above the maximum %d\n"), tmp_str, _temp_range.max);
+    _thermostat_cycle = cooling;
+  }
+
+  // active cycle
+  if ((_thermostat_mode_cooler && _thermostat_cycle == cooling) ||
+     (!_thermostat_mode_cooler && _thermostat_cycle == heating)) {
+    if (relayStatus(THERMOSTAT_RELAY) == RelayStatus::Off) {
+        // if relay is OFF switch it ON if min_off_time passed by
+        if (_thermostat.last_switch == 0 || lastSwitchEarlierThan(_thermostat_min_off_time)) {
+          switchThermostat(true, tmp_str, _thermostat_mode_cooler ? "start/continue cooling" : "start/continue heating");
+        } else {
+          int rest_mins_left = (_thermostat_min_off_time - (millis() - _thermostat.last_switch))/MILLIS_IN_MIN + 1;
+          DEBUG_MSG_P(PSTR("[THERMOSTAT] thermostat is in rest state for %d min\n"), rest_mins_left);
+        }
+      // if thermostat works more than max_on_time it need rest
+    } else if (lastSwitchEarlierThan(_thermostat_max_on_time)) {
+      switchThermostat(false, tmp_str, "thermostat switch OFF for 10 min to give rest for heater/cooler");
+    } else {
+      DEBUG_MSG_P(PSTR("[THERMOSTAT] thermostat is active.\n"));
     }
-  } else { // Thermostat is COOLER. Inverse logic.
-    // if thermostat switched ON and t < min - switch it OFF and start heating
-    if (relayStatus(THERMOSTAT_RELAY) && temp < _temp_range.min) {
-      _thermostat_cycle = heating;
-      switchThermostat(false, temp);
-    // if thermostat switched ON for max time - switch it OFF for rest
-    } else if (relayStatus(THERMOSTAT_RELAY) && lastSwitchEarlierThan(_thermostat_max_on_time)) {
-      switchThermostat(false, temp);
-    // if t > max and thermostat switched OFF for at least minimum time - switch it ON and start
-    } else if (!relayStatus(THERMOSTAT_RELAY) && temp > _temp_range.max
-        && (_thermostat.last_switch == 0 || lastSwitchEarlierThan(_thermostat_min_off_time))) {
-      _thermostat_cycle = cooling;
-      switchThermostat(true, temp);
-    // if cooling cycle and thermostat switchaed OFF for more than min time - switch it ON
-    // continue cooling cycle
-    } else if (!relayStatus(THERMOSTAT_RELAY) && _thermostat_cycle == cooling
-        && lastSwitchEarlierThan(_thermostat_min_off_time)) {
-      switchThermostat(true, temp);
-    }
+    // pasive cycle
+  } else if (relayStatus(THERMOSTAT_RELAY) == RelayStatus::On) {
+    // if relay is ON - switch it OFF
+      switchThermostat(false, tmp_str, _thermostat_mode_cooler ? "start heating cycle" : "start cooling cycle");
   }
 }
 
 //------------------------------------------------------------------------------
 void updateCounters() {
-  if (relayStatus(THERMOSTAT_RELAY)) {
+  if (relayStatus(THERMOSTAT_RELAY) == RelayStatus::On) {
     setSetting(NAME_BURN_TOTAL,      ++_thermostat_burn_total);
     setSetting(NAME_BURN_TODAY,      ++_thermostat_burn_today);
     setSetting(NAME_BURN_THIS_MONTH, ++_thermostat_burn_this_month);
@@ -404,17 +403,27 @@ void updateCounters() {
 double _getLocalValue(const char* description, unsigned char type) {
 #if SENSOR_SUPPORT
     for (unsigned char index = 0; index < magnitudeCount(); ++index) {
-        if (magnitudeType(index) != type) continue;
-        auto value = magnitudeValue(index);
-
-        char tmp_str[16];
-        magnitudeFormat(value, tmp_str, sizeof(tmp_str));
-        DEBUG_MSG_P(PSTR("[THERMOSTAT] %s: %s\n"), description, tmp_str);
-
-        return value.get();
+        if (magnitudeType(index) == type) {
+            const auto value = magnitudeValue(index);
+            DEBUG_MSG_P(PSTR("[THERMOSTAT] %s: %s\n"),
+                    description, value.repr.c_str());
+            return value.value;
+        }
     }
 #endif
-  return std::numeric_limits<double>::quiet_NaN();
+    return espurna::sensor::Value::Unknown;
+}
+
+String _getLocalUnit(unsigned char type) {
+#if SENSOR_SUPPORT
+    for (unsigned char index = 0; index < magnitudeCount(); ++index) {
+        const auto info = magnitudeInfo(index);
+        if (info.type == type) {
+            return magnitudeUnitsName(info.units);
+        }
+    }
+#endif
+    return F("none");
 }
 
 double getLocalTemperature() {
@@ -461,10 +470,20 @@ void thermostatLoop(void) {
       // we don't have any temp - switch thermostat on for N minutes every hour
       _thermostat.temperature_source = temp_none;
       DEBUG_MSG_P(PSTR("[THERMOSTAT] setup thermostat by timeout\n"));
-      if (relayStatus(THERMOSTAT_RELAY) && millis() - _thermostat.last_switch > _thermostat_alone_on_time) {
-        setThermostatState(false);
-      } else if (!relayStatus(THERMOSTAT_RELAY) && millis() - _thermostat.last_switch > _thermostat_alone_off_time) {
-        setThermostatState(false);
+      const auto now = millis();
+      switch (relayStatus(THERMOSTAT_RELAY)) {
+      case RelayStatus::On:
+        if (now - _thermostat.last_switch > _thermostat_alone_on_time) {
+          setThermostatState(false);
+        }
+        break;
+      case RelayStatus::Off:
+      case RelayStatus::NotReady:
+      case RelayStatus::NotAvailable:
+        if (now - _thermostat.last_switch > _thermostat_alone_off_time) {
+          setThermostatState(false);
+        }
+        break;
       }
     }
     if (last_temp_src != _thermostat.temperature_source) {
@@ -511,28 +530,28 @@ void resetBurnCounters() {
 
 #define wifi_on_width 16
 #define wifi_on_height 16
-const char wifi_on_bits[] PROGMEM = {
+const uint8_t wifi_on_bits[] PROGMEM = {
   0x00, 0x00, 0x0E, 0x00, 0x7E, 0x00, 0xFE, 0x01, 0xE0, 0x03, 0x80, 0x07,
   0x02, 0x0F, 0x1E, 0x1E, 0x3E, 0x1C, 0x78, 0x38, 0xE0, 0x38, 0xC0, 0x31,
   0xC6, 0x71, 0x8E, 0x71, 0x8E, 0x73, 0x00, 0x00, };
 
 #define mqtt_width 16
 #define mqtt_height 16
-const char mqtt_bits[] PROGMEM = {
+const uint8_t mqtt_bits[] PROGMEM = {
   0x00, 0x00, 0x00, 0x08, 0x00, 0x18, 0x00, 0x38, 0xEA, 0x7F, 0xEA, 0x7F,
   0x00, 0x38, 0x10, 0x18, 0x18, 0x08, 0x1C, 0x00, 0xFE, 0x57, 0xFE, 0x57,
   0x1C, 0x00, 0x18, 0x00, 0x10, 0x00, 0x00, 0x00, };
 
 #define remote_temp_width 16
 #define remote_temp_height 16
-const char remote_temp_bits[] PROGMEM = {
+const uint8_t remote_temp_bits[] PROGMEM = {
   0x00, 0x00, 0xE0, 0x18, 0x10, 0x25, 0x10, 0x25, 0x90, 0x19, 0x50, 0x01,
   0x50, 0x01, 0xD0, 0x01, 0x50, 0x01, 0x50, 0x01, 0xD0, 0x01, 0x50, 0x01,
   0xE0, 0x00, 0xE0, 0x00, 0xE0, 0x00, 0x00, 0x00, };
 
 #define server_width 16
 #define server_height 16
-const char server_bits[] PROGMEM = {
+const uint8_t server_bits[] PROGMEM = {
   0x00, 0x00, 0xF8, 0x1F, 0xFC, 0x3F, 0x0C, 0x30, 0x0C, 0x30, 0x0C, 0x30,
   0x0C, 0x30, 0x0C, 0x30, 0x0C, 0x30, 0xF8, 0x1F, 0xFC, 0x3F, 0xFE, 0x7F,
   0x1E, 0x78, 0xFE, 0x7F, 0xFC, 0x3F, 0x00, 0x00, };
@@ -555,7 +574,7 @@ bool _display_need_refresh  = true;
 bool _temp_range_need_update = true;
 
 //------------------------------------------------------------------------------
-void drawIco(int16_t x, int16_t y, const char *ico, bool on = true) {
+void drawIco(int16_t x, int16_t y, const uint8_t *ico, bool on = true) {
   display.drawIco16x16(x, y, ico, !on);
   _display_need_refresh = true;
 }
@@ -763,10 +782,14 @@ void displayLoop() {
 
 #if WEB_SUPPORT
 //------------------------------------------------------------------------------
+void _thermostatWebSocketOnVisible(JsonObject& root) {
+    wsPayloadModule(root, STRING_VIEW("thermostat"));
+}
+
 void _thermostatWebSocketOnConnected(JsonObject& root) {
   root["thermostatEnabled"] = thermostatEnabled();
   root["thermostatMode"] = thermostatModeCooler();
-  root["thermostatVisible"] = 1;
+  root["thermostatTmpUnits"] = _getLocalUnit(MAGNITUDE_TEMPERATURE);
   root[NAME_TEMP_RANGE_MIN] = _temp_range.min;
   root[NAME_TEMP_RANGE_MAX] = _temp_range.max;
   root[NAME_REMOTE_SENSOR_NAME] = _thermostat.remote_sensor_name;
@@ -793,18 +816,18 @@ void _thermostatWebSocketOnConnected(JsonObject& root) {
 }
 
 //------------------------------------------------------------------------------
-bool _thermostatWebSocketOnKeyCheck(const char * key, JsonVariant& value) {
-    if (strncmp(key, NAME_THERMOSTAT_ENABLED,   strlen(NAME_THERMOSTAT_ENABLED))   == 0) return true;
-    if (strncmp(key, NAME_THERMOSTAT_MODE,      strlen(NAME_THERMOSTAT_MODE))      == 0) return true;
-    if (strncmp(key, NAME_TEMP_RANGE_MIN,       strlen(NAME_TEMP_RANGE_MIN))       == 0) return true;
-    if (strncmp(key, NAME_TEMP_RANGE_MAX,       strlen(NAME_TEMP_RANGE_MAX))       == 0) return true;
-    if (strncmp(key, NAME_REMOTE_SENSOR_NAME,   strlen(NAME_REMOTE_SENSOR_NAME))   == 0) return true;
-    if (strncmp(key, NAME_REMOTE_TEMP_MAX_WAIT, strlen(NAME_REMOTE_TEMP_MAX_WAIT)) == 0) return true;
-    if (strncmp(key, NAME_MAX_ON_TIME,          strlen(NAME_MAX_ON_TIME))          == 0) return true;
-    if (strncmp(key, NAME_MIN_OFF_TIME,         strlen(NAME_MIN_OFF_TIME))         == 0) return true;
-    if (strncmp(key, NAME_ALONE_ON_TIME,        strlen(NAME_ALONE_ON_TIME))        == 0) return true;
-    if (strncmp(key, NAME_ALONE_OFF_TIME,       strlen(NAME_ALONE_OFF_TIME))       == 0) return true;
-    return false;
+bool _thermostatWebSocketOnKeyCheck(espurna::StringView key, const JsonVariant&) {
+    return key == NAME_THERMOSTAT_ENABLED
+        || key == NAME_THERMOSTAT_ENABLED
+        || key == NAME_THERMOSTAT_MODE
+        || key == NAME_TEMP_RANGE_MIN
+        || key == NAME_TEMP_RANGE_MAX
+        || key == NAME_REMOTE_SENSOR_NAME
+        || key == NAME_REMOTE_TEMP_MAX_WAIT
+        || key == NAME_MAX_ON_TIME
+        || key == NAME_MIN_OFF_TIME
+        || key == NAME_ALONE_ON_TIME
+        || key == NAME_ALONE_OFF_TIME;
 }
 
 //------------------------------------------------------------------------------
@@ -832,6 +855,7 @@ void thermostatSetup() {
   // Websockets
   #if WEB_SUPPORT
       wsRegister()
+          .onVisible(_thermostatWebSocketOnVisible)
           .onConnected(_thermostatWebSocketOnConnected)
           .onKeyCheck(_thermostatWebSocketOnKeyCheck)
           .onAction(_thermostatWebSocketOnAction);

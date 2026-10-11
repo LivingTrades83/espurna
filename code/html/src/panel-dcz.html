@@ -1,0 +1,55 @@
+<form id="form-domoticz" class="pure-form pure-form-aligned form-settings">
+    <div class="panel" id="panel-domoticz">
+
+        <div class="header">
+            <h1>DOMOTICZ</h1>
+            <h2>
+                Configure the connection to your Domoticz server.
+            </h2>
+        </div>
+
+        <div class="page">
+            <fieldset>
+                <legend>General</legend>
+
+                <div class="pure-control-group">
+                    <label>Enabled</label>
+                    <input class="checkbox-toggle" type="checkbox" name="dczEnabled">
+                </div>
+
+                <div class="pure-control-group">
+                    <label>IN Topic</label>
+                    <input class="pure-input-2-3" name="dczTopicIn" type="text">
+                </div>
+
+                <div class="pure-control-group">
+                    <label>OUT Topic</label>
+                    <input class="pure-input-2-3" name="dczTopicOut" type="text" data-action="reconnect">
+                </div>
+            </fieldset>
+
+            <p class="pure-form-message">
+                Set IDX to 0 to disable notifications from the component.
+            </p>
+
+            <fieldset class="module module-light">
+                <legend>Lights (IN messages only)</legend>
+                <div class="pure-control-group">
+                    <label>Light switch</label>
+                    <input name="dczLightIdx" type="number" min="0" required >
+                </div>
+            </fieldset>
+
+            <fieldset class="module module-relay">
+                <legend>Relays</legend>
+                <div id="dcz-relays" class="settings-group" ></div>
+            </fieldset>
+
+            <fieldset class="module module-sns">
+                <legend>Sensors</legend>
+                <div id="dcz-magnitudes" class="settings-group" ></div>
+            </fieldset>
+        </div>
+
+    </div>
+</form>

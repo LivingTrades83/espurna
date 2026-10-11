@@ -6,62 +6,108 @@ Copyright (C) 2020 by Maxim Prokhorov <prokhorov dot max at outlook dot com>
 
 */
 
+#include "espurna.h"
 #include "rpc.h"
 
-#include <Schedule.h>
 #include <cstring>
 
 #include "system.h"
 #include "utils.h"
 
-bool rpcHandleAction(const String& action) {
-    bool result = false;
-    if (action.equals("reboot")) {
-        result = true;
-        schedule_function([]() {
-            deferredReset(100, CustomResetReason::Rpc);
-        });
-    } else if (action.equals("heartbeat")) {
-        result = true;
-        systemScheduleHeartbeat();
-    }
-    return result;
+namespace espurna {
+namespace rpc {
+namespace {
+
+STRING_VIEW_INLINE(Heartbeat, "heartbeat");
+STRING_VIEW_INLINE(Reboot, "reboot");
+STRING_VIEW_INLINE(Reload, "reload");
+
+STRING_VIEW_INLINE(On, "on");
+STRING_VIEW_INLINE(Off, "off");
+STRING_VIEW_INLINE(Toggle, "toggle");
+
+void prepareReset() {
+    ::prepareReset(CustomResetReason::Rpc);
 }
 
-PayloadStatus rpcParsePayload(const char* payload, const rpc_payload_check_t ext_check) {
+void prepareResetOnce() {
+    espurnaRegisterOnce(espurna::rpc::prepareReset);
+}
 
-    // Don't parse empty strings
-    const auto len = strlen(payload);
-    if (!len) return PayloadStatus::Unknown;
+using Callback = void (*)();
+
+struct Action {
+    StringView name;
+    Callback callback;
+};
+
+constexpr const Action Actions[] PROGMEM {
+    {Heartbeat, systemScheduleHeartbeat},
+    {Reboot, prepareResetOnce},
+    {Reload, espurnaReload},
+};
+
+bool handle_action(StringView other) {
+    for (const auto& action : Actions) {
+        if (action.name.equals(other)) {
+            action.callback();
+            return true;
+        }
+    }
+
+    return false;
+}
+
+PayloadStatus parse(StringView payload, RpcPayloadCheck check) {
+    if (!payload.length()) {
+        return PayloadStatus::Unknown;
+    }
 
     // Check most commonly used payloads
-    if (len == 1) {
-        if (payload[0] == '0') return PayloadStatus::Off;
-        if (payload[0] == '1') return PayloadStatus::On;
-        if (payload[0] == '2') return PayloadStatus::Toggle;
+    if (payload.length() == 1) {
+        switch (*payload.begin()) {
+        case '0':
+            return PayloadStatus::Off;
+        case '1':
+            return PayloadStatus::On;
+        case '2':
+            return PayloadStatus::Toggle;
+        }
         return PayloadStatus::Unknown;
     }
 
     // If possible, use externally provided payload checker
-    if (ext_check) {
-        const PayloadStatus result = ext_check(payload);
+    if (check) {
+        const auto result = check(payload);
         if (result != PayloadStatus::Unknown) {
             return result;
         }
     }
 
     // Finally, check for "OFF", "ON", "TOGGLE" (both lower and upper cases)
-    String temp(payload);
-    temp.trim();
-
-    if (temp.equalsIgnoreCase("off")) {
+    if (payload.equalsIgnoreCase(Off)) {
         return PayloadStatus::Off;
-    } else if (temp.equalsIgnoreCase("on")) {
+    } else if (payload.equalsIgnoreCase(On)) {
         return PayloadStatus::On;
-    } else if (temp.equalsIgnoreCase("toggle")) {
+    } else if (payload.equalsIgnoreCase(Toggle)) {
         return PayloadStatus::Toggle;
     }
 
     return PayloadStatus::Unknown;
+}
 
+} // namespace
+} // namespace rpc
+} // namespace espurna
+
+bool rpcHandleAction(espurna::StringView action) {
+    return espurna::rpc::handle_action(action);
+}
+
+PayloadStatus rpcParsePayload(espurna::StringView payload, RpcPayloadCheck check) {
+    return espurna::rpc::parse(payload, check);
+}
+
+PayloadStatus rpcParsePayload(espurna::StringView payload) {
+    return espurna::rpc::parse(payload, nullptr);
 }

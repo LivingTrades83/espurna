@@ -9,49 +9,99 @@ Copyright (C) 2020 by Maxim Prokhorov <prokhorov dot max at outlook dot com>
 
 #include "espurna.h"
 
+#if WEB_SUPPORT
 #include "api.h"
-
-#include "ws.h"
 #include "web.h"
+#include "ws.h"
+#endif
 
 // -----------------------------------------------------------------------------
 
-#if WEB_SUPPORT
-
+namespace espurna {
+namespace api {
 namespace {
 
-bool _apiWebSocketOnKeyCheck(const char * key, JsonVariant& value) {
-    return (strncmp(key, "api", 3) == 0);
+namespace param {
+
+STRING_VIEW_INLINE(Key, "apikey");
+
+} // namespace param
+
+bool reserved_param(StringView value) {
+    return value == param::Key;
 }
 
-void _apiWebSocketOnConnected(JsonObject& root) {
-    root["apiEnabled"] = apiEnabled();
-    root["apiKey"] = apiKey();
-    root["apiRestFul"] = apiRestFul();
-    root["apiRealTime"] = getSetting("apiRealTime", 1 == API_REAL_TIME_VALUES);
+namespace build {
+
+constexpr bool enabled() {
+    return 1 == API_ENABLED;
 }
 
+constexpr bool restful() {
+    return 1 == API_RESTFUL;
 }
 
-// -----------------------------------------------------------------------------
-// Public API
-// -----------------------------------------------------------------------------
+STRING_VIEW_INLINE(Key, API_KEY);
 
-bool apiEnabled() {
-    return getSetting("apiEnabled", 1 == API_ENABLED);
+constexpr StringView key() {
+    return Key;
 }
 
-bool apiRestFul() {
-    return getSetting("apiRestFul", 1 == API_RESTFUL);
+} // namespace build
+
+namespace settings {
+namespace keys {
+
+STRING_VIEW_INLINE(Enabled, "apiEnabled");
+STRING_VIEW_INLINE(Restful, "apiRestFul");
+STRING_VIEW_INLINE(Key, "apiKey");
+
+} // namespace keys
+
+bool enabled() {
+    return getSetting(keys::Enabled, build::enabled());
 }
 
-String apiKey() {
-    return getSetting("apiKey", API_KEY);
+bool restful() {
+    return getSetting(keys::Restful, build::restful());
 }
 
-bool apiAuthenticateHeader(AsyncWebServerRequest* request, const String& key) {
-    if (apiEnabled() && key.length()) {
-        auto* header = request->getHeader(F("Api-Key"));
+String key() {
+    return getSetting(keys::Key, build::key());
+}
+
+} // namespace settings
+
+namespace web {
+#if WEB_SUPPORT
+
+STRING_VIEW_INLINE(Prefix, "api");
+
+bool onKeyCheck(espurna::StringView key, const JsonVariant&) {
+    return key.startsWith(Prefix);
+}
+
+void onVisible(JsonObject& root) {
+    wsPayloadModule(root, Prefix);
+}
+
+void onConnected(JsonObject& root) {
+    root[settings::keys::Enabled] = apiEnabled();
+    root[settings::keys::Key] = apiKey();
+    root[settings::keys::Restful] = apiRestFul();
+}
+
+void setup() {
+    wsRegister()
+        .onVisible(onVisible)
+        .onConnected(onConnected)
+        .onKeyCheck(onKeyCheck);
+}
+
+bool authenticate_header(AsyncWebServerRequest* request, const String& key) {
+    STRING_VIEW_INLINE(Header, "Api-Key");
+    if (settings::enabled() && key.length()) {
+        auto* header = request->getHeader(Header.toString());
         if (header && (key == header->value())) {
             return true;
         }
@@ -60,37 +110,61 @@ bool apiAuthenticateHeader(AsyncWebServerRequest* request, const String& key) {
     return false;
 }
 
-bool apiAuthenticateParam(AsyncWebServerRequest* request, const String& key) {
-    auto* param = request->getParam("apikey", (request->method() == HTTP_PUT));
-    if (param && (key == param->value())) {
-        return true;
+bool authenticate_param(AsyncWebServerRequest* request, const String& key) {
+    const auto name = espurna::api::param::Key.toString();
+    const auto* param = request->getParam(name, (request->method() == HTTP_PUT));
+    return param && (key == param->value());
+}
+
+bool authenticate(AsyncWebServerRequest* request) {
+    const auto key = apiKey();
+    if (key.length()) {
+        return authenticate_header(request, key)
+            || authenticate_param(request, key);
     }
 
     return false;
+}
+
+#endif
+} // namespace web
+
+} // namespace
+} // namespace api
+} // namespace espurna
+
+#if WEB_SUPPORT
+bool apiAuthenticateHeader(AsyncWebServerRequest* request, const String& key) {
+    return espurna::api::web::authenticate_header(request, key);
+}
+
+bool apiAuthenticateParam(AsyncWebServerRequest* request, const String& key) {
+    return espurna::api::web::authenticate_param(request, key);
 }
 
 bool apiAuthenticate(AsyncWebServerRequest* request) {
-    const auto key = apiKey();
-    if (!key.length()) {
-        return false;
-    }
+    return espurna::api::web::authenticate(request);
+}
+#endif
 
-    if (apiAuthenticateHeader(request, key)) {
-        return true;
-    }
+bool apiReservedParam(espurna::StringView value) {
+    return espurna::api::reserved_param(value);
+}
 
-    if (apiAuthenticateParam(request, key)) {
-        return true;
-    }
+String apiKey() {
+    return espurna::api::settings::key();
+}
 
-    return false;
+bool apiEnabled() {
+    return espurna::api::settings::enabled();
+}
+
+bool apiRestFul() {
+    return espurna::api::settings::restful();
 }
 
 void apiCommonSetup() {
-    wsRegister()
-        .onVisible([](JsonObject& root) { root["apiVisible"] = 1; })
-        .onConnected(_apiWebSocketOnConnected)
-        .onKeyCheck(_apiWebSocketOnKeyCheck);
+#if WEB_SUPPORT
+    espurna::api::web::setup();
+#endif
 }
-
-#endif // WEB_SUPPORT == 1

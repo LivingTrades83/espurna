@@ -6,7 +6,7 @@ Original module
 Copyright (C) 2017-2019 by Xose Pérez <xose dot perez at gmail dot com>
 
 Reworked queueing and RAM usage reduction
-Copyright (C) 2019-2021 by Maxim Prokhorov <prokhorov dot max at outlook dot com>
+Copyright (C) 2019-2022 by Maxim Prokhorov <prokhorov dot max at outlook dot com>
 
 */
 
@@ -14,10 +14,12 @@ Copyright (C) 2019-2021 by Maxim Prokhorov <prokhorov dot max at outlook dot com
 
 #if HOMEASSISTANT_SUPPORT
 
+#include "homeassistant.h"
 #include "light.h"
 #include "mqtt.h"
 #include "relay.h"
 #include "sensor.h"
+#include "web.h"
 #include "ws.h"
 
 #include <ArduinoJson.h>
@@ -25,101 +27,237 @@ Copyright (C) 2019-2021 by Maxim Prokhorov <prokhorov dot max at outlook dot com
 #include <forward_list>
 #include <memory>
 
+namespace espurna {
 namespace homeassistant {
+namespace {
+
+enum class State {
+    Disabled,
+    Enabled,
+};
+
+namespace build {
+
+constexpr bool enabled() {
+    return 1 == HOMEASSISTANT_ENABLED;
+}
+
+STRING_VIEW_INLINE(Prefix, HOMEASSISTANT_PREFIX);
+
+constexpr StringView prefix() {
+    return Prefix;
+}
+
+constexpr bool retain() {
+    return 1 == HOMEASSISTANT_RETAIN;
+}
+
+STRING_VIEW_INLINE(BirthTopic, HOMEASSISTANT_BIRTH_TOPIC);
+
+constexpr StringView birthTopic() {
+    return BirthTopic;
+}
+
+STRING_VIEW_INLINE(BirthPayload, HOMEASSISTANT_BIRTH_PAYLOAD);
+
+constexpr StringView birthPayload() {
+    return BirthPayload;
+}
+
+} // namespace build
+
+namespace settings {
+namespace keys {
+
+STRING_VIEW_INLINE(Enabled, "haEnabled");
+STRING_VIEW_INLINE(Prefix, "haPrefix");
+STRING_VIEW_INLINE(Retain, "haRetain");
+
+STRING_VIEW_INLINE(BirthTopic, "haBirthTopic");
+STRING_VIEW_INLINE(BirthPayload, "haBirthPayload");
+
+} // namespace keys
+
+bool enabled() {
+    return getSetting(keys::Enabled, build::enabled());
+}
+
+String prefix() {
+    return getSetting(keys::Prefix, build::prefix());
+}
+
+bool retain() {
+    return getSetting(keys::Retain, build::retain());
+}
+
+String birthTopic() {
+    return getSetting(keys::BirthTopic, build::birthTopic());
+}
+
+String birthPayload() {
+    return getSetting(keys::BirthPayload, build::birthPayload());
+}
+
+namespace query {
+namespace internal {
+
+#define EXACT_VALUE(NAME, FUNC)\
+String NAME () {\
+    return espurna::settings::internal::serialize(FUNC());\
+}
+
+EXACT_VALUE(enabled, settings::enabled)
+EXACT_VALUE(retain, settings::retain)
+
+} // namespace internal
+
+static constexpr espurna::settings::query::Setting Settings[] PROGMEM {
+    {keys::Enabled, internal::enabled},
+    {keys::Prefix, settings::prefix},
+    {keys::Retain, internal::retain},
+    {keys::BirthTopic, settings::birthTopic},
+    {keys::BirthPayload, settings::birthPayload},
+};
+
+STRING_VIEW_INLINE(Prefix, "ha");
+
+bool checkSamePrefix(espurna::StringView key) {
+    return key.startsWith(Prefix);
+}
+
+espurna::settings::query::Result findFrom(StringView key) {
+    return espurna::settings::query::findFrom(Settings, key);
+}
+
+void setup() {
+    ::settingsRegisterQueryHandler({
+        .check = checkSamePrefix,
+        .get = findFrom,
+    });
+}
+
+} // namespace query
+} // namespace settings
 
 // Output is supposed to be used as both part of the MQTT config topic and the `uniq_id` field
 // TODO: manage UTF8 strings? in case we somehow receive `desc`, like it was done originally
 
-String normalize_ascii(String&& value, bool lower = false) {
-    auto* ptr = const_cast<char*>(value.c_str());
-    for (;;) {
+String normalize_ascii(String value, bool lower) {
+    for (auto ptr = value.begin(); ptr != value.end(); ++ptr) {
         switch (*ptr) {
         case '\0':
-            goto return_value;
+            goto done;
         case '0' ... '9':
         case 'a' ... 'z':
             break;
         case 'A' ... 'Z':
             if (lower) {
-                *ptr += 32;
+                *ptr = (*ptr + 32);
             }
             break;
         default:
             *ptr = '_';
             break;
         }
-        ++ptr;
     }
 
-return_value:
-    return std::move(value);
+done:
+    return value;
+}
+
+String normalize_ascii(StringView value, bool lower) {
+    return normalize_ascii(String(value), lower);
 }
 
 // Common data used across the discovery payloads.
 // ref. https://developers.home-assistant.io/docs/entity_registry_index/
 
+// 'runtime' strings, may be changed in settings
+struct ConfigStrings {
+    String name;
+    String identifier;
+    String prefix;
+};
+
+using ConfigStringsPtr = std::unique_ptr<ConfigStrings>;
+
+ConfigStringsPtr make_config_strings() {
+    return ConfigStringsPtr(
+        new ConfigStrings{
+            .name = normalize_ascii(systemHostname(), false),
+            .identifier = normalize_ascii(systemIdentifier(), true),
+            .prefix = settings::prefix(),
+        });
+}
+
+// 'build-time' strings, always the same for current build
+struct BuildStrings {
+    String version;
+    String manufacturer;
+    String device;
+};
+
+using BuildStringsPtr = std::unique_ptr<BuildStrings>;
+
+BuildStringsPtr make_build_strings() {
+    const auto app = buildApp();
+    const auto hardware = buildHardware();
+    return BuildStringsPtr(
+        new BuildStrings{
+            .version = app.version.toString(),
+            .manufacturer = hardware.manufacturer.toString(),
+            .device = hardware.device.toString(),
+        });
+}
+
 class Device {
 public:
-    struct Strings {
-        Strings() = delete;
-        Strings(const Strings&) = delete;
-
-        Strings(Strings&&) = default;
-        Strings(String&& prefix_, String&& name_, const String& identifier_, const char* version_, const char* manufacturer_, const char* device_) :
-            prefix(std::move(prefix_)),
-            name(std::move(name_)),
-            identifier(identifier_),
-            version(version_),
-            manufacturer(manufacturer_),
-            device(device_)
-        {
-            name = normalize_ascii(std::move(name));
-            identifier = normalize_ascii(std::move(identifier), true);
-        }
-
-        String prefix;
-        String name;
-        String identifier;
-        const char* version;
-        const char* manufacturer;
-        const char* device;
-    };
-
-    using StringsPtr = std::unique_ptr<Strings>;
-
-    static constexpr size_t BufferSize { JSON_ARRAY_SIZE(1) + JSON_OBJECT_SIZE(1) + JSON_OBJECT_SIZE(5) };
+    // XXX: take care when adding / removing keys and values below
+    // - `const char*` is copied by pointer value, persistent pointers make sure
+    //   it is valid for the duration of this objects lifetime
+    // - `F(...)` aka `__FlashStringHelpe` **will take more space**
+    //   it is **copied inside of the buffer**, and will take `strlen()` bytes
+    // - allocating more objects **will silently corrupt** buffer region
+    //   while there are *some* checks, current version is going to break
+    static constexpr size_t BufferSize { JSON_ARRAY_SIZE(1) + JSON_OBJECT_SIZE(6) };
 
     using Buffer = StaticJsonBuffer<BufferSize>;
     using BufferPtr = std::unique_ptr<Buffer>;
 
     Device() = delete;
-    Device(const Device&) = delete;
 
-    Device(Device&&) = default;
-    Device(String&& prefix, String&& name, const String& identifier, const char* version, const char* manufacturer, const char* device) :
-        _strings(std::make_unique<Strings>(std::move(prefix), std::move(name), identifier, version, manufacturer, device)),
+    Device(const Device&) = delete;
+    Device& operator=(const Device&) = delete;
+
+    Device(Device&&) = delete;
+    Device& operator=(Device&&) = delete;
+
+    Device(ConfigStringsPtr config, BuildStringsPtr build) :
+        _config(std::move(config)),
+        _build(std::move(build)),
         _buffer(std::make_unique<Buffer>()),
         _root(_buffer->createObject())
     {
-        JsonArray& ids = _root.createNestedArray("ids");
-        ids.add(_strings->identifier.c_str());
+        _root["name"] = _config->name.c_str();
 
-        _root["name"] = _strings->name.c_str();
-        _root["sw"] = _strings->version;
-        _root["mf"] = _strings->manufacturer;
-        _root["mdl"] = _strings->device;
+        auto& ids = _root.createNestedArray("ids");
+        ids.add(_config->identifier.c_str());
+
+        _root["sw"] = _build->version.c_str();
+        _root["mf"] = _build->manufacturer.c_str();
+        _root["mdl"] = _build->device.c_str();
     }
 
     const String& name() const {
-        return _strings->name;
+        return _config->name;
     }
 
     const String& prefix() const {
-        return _strings->prefix;
+        return _config->prefix;
     }
 
     const String& identifier() const {
-        return _strings->identifier;
+        return _config->identifier;
     }
 
     JsonObject& root() {
@@ -127,7 +265,9 @@ public:
     }
 
 private:
-    StringsPtr _strings;
+    ConfigStringsPtr _config;
+    BuildStringsPtr _build;
+
     BufferPtr _buffer;
     JsonObject& _root;
 };
@@ -138,7 +278,7 @@ using JsonBufferPtr = std::unique_ptr<DynamicJsonBuffer>;
 class Context {
 public:
     Context() = delete;
-    Context(DevicePtr&& device, size_t capacity) :
+    Context(DevicePtr device, size_t capacity) :
         _device(std::move(device)),
         _capacity(capacity)
     {}
@@ -191,19 +331,6 @@ private:
     size_t _capacity { 0ul };
 };
 
-Context makeContext() {
-    auto device = std::make_unique<Device>(
-        getSetting("haPrefix", HOMEASSISTANT_PREFIX),
-        getSetting("hostname", getIdentifier()),
-        getIdentifier(),
-        getVersion(),
-        getManufacturer(),
-        getDevice()
-    );
-
-    return Context(std::move(device), 2048ul);
-}
-
 String quote(String&& value) {
     if (value.equalsIgnoreCase("y")
         || value.equalsIgnoreCase("n")
@@ -212,8 +339,8 @@ String quote(String&& value) {
         || value.equalsIgnoreCase("true")
         || value.equalsIgnoreCase("false")
         || value.equalsIgnoreCase("on")
-        || value.equalsIgnoreCase("off")
-    ) {
+        || value.equalsIgnoreCase("off"))
+    {
         String result;
         result.reserve(value.length() + 2);
         result += '"';
@@ -232,46 +359,38 @@ String quote(String&& value) {
 // - In case the object uses the JSON makeObject() as state, make sure we don't use it (state)
 //   and the object itself after next() or ok() return false
 // - Make sure JSON state is not created on construction, but lazy-loaded as soon as it is needed.
-//   Meaning, we don't cause invalid refs immediatly when there are more than 1 discovery object present and we reset the storage.
+//   Meaning, we don't cause invalid refs immediately when there are more than 1 discovery object present and we reset the storage.
 
 class Discovery {
 public:
-    virtual ~Discovery() {
-    }
+    virtual ~Discovery();
 
     virtual bool ok() const = 0;
+
     virtual const String& topic() = 0;
     virtual const String& message() = 0;
+
+    virtual bool prepare();
+    virtual bool ready() const;
     virtual bool next() = 0;
 };
 
-#if RELAY_SUPPORT
+Discovery::~Discovery() = default;
 
-struct RelayContext {
-    String availability;
-    String payload_available;
-    String payload_not_available;
-    String payload_on;
-    String payload_off;
-};
-
-RelayContext makeRelayContext() {
-    return {
-        mqttTopic(MQTT_TOPIC_STATUS, false),
-        quote(mqttPayloadStatus(true)),
-        quote(mqttPayloadStatus(false)),
-        quote(relayPayload(PayloadStatus::On)),
-        quote(relayPayload(PayloadStatus::Off))
-    };
+bool Discovery::prepare() {
+    return true;
 }
+
+bool Discovery::ready() const {
+    return true;
+}
+
+#if RELAY_SUPPORT
 
 class RelayDiscovery : public Discovery {
 public:
-    RelayDiscovery() = delete;
     explicit RelayDiscovery(Context& ctx) :
-        _ctx(ctx),
-        _relay(makeRelayContext()),
-        _relays(relayCount())
+        _ctx(ctx)
     {}
 
     JsonObject& root() {
@@ -282,14 +401,21 @@ public:
         return *_root;
     }
 
+    bool ready() const override {
+        return _ready;
+    }
+
     bool ok() const override {
-        return (_relays) && (_index < _relays);
+        return _ready
+            && (_count > 0)
+            && (_index < _count);
     }
 
     const String& uniqueId() {
         if (!_unique_id.length()) {
-            _unique_id = _ctx.identifier() + '_' + F("relay") + '_' + _index;
+            _unique_id = _ctx.identifier() + '_' + F("relay") + '_' + String(_index, 10);
         }
+
         return _unique_id;
     }
 
@@ -300,32 +426,45 @@ public:
             _topic += uniqueId();
             _topic += F("/config");
         }
+
         return _topic;
     }
 
     const String& message() override {
         if (!_message.length()) {
             auto& json = root();
-            json["dev"] = _ctx.device();
-            json["avty_t"] = _relay.availability.c_str();
-            json["pl_avail"] = _relay.payload_available.c_str();
-            json["pl_not_avail"] = _relay.payload_not_available.c_str();
-            json["pl_on"] = _relay.payload_on.c_str();
-            json["pl_off"] = _relay.payload_off.c_str();
-            json["uniq_id"] = uniqueId();
-            json["name"] = _ctx.name() + ' ' + _index;
-            json["stat_t"] = mqttTopic(MQTT_TOPIC_RELAY, _index, false);
-            json["cmd_t"] = mqttTopic(MQTT_TOPIC_RELAY, _index, true);
+            json[F("dev")] = _ctx.device();
+            json[F("avty_t")] = _info->availability.c_str();
+            json[F("pl_avail")] = _info->payload_available.c_str();
+            json[F("pl_not_avail")] = _info->payload_not_available.c_str();
+            json[F("pl_on")] = _info->payload_on.c_str();
+            json[F("pl_off")] = _info->payload_off.c_str();
+            json[F("uniq_id")] = uniqueId();
+            json[F("name")] = _ctx.name() + ' ' + String(_index, 10);
+            json[F("stat_t")] = mqttTopic(MQTT_TOPIC_RELAY, _index);
+            json[F("cmd_t")] = mqttTopicSetter(MQTT_TOPIC_RELAY, _index);
             json.printTo(_message);
         }
+
         return _message;
     }
 
+    bool prepare() override {
+        if (!_ready) {
+            _count = relayCount();
+            _index = 0;
+            _info = _makeInfo();
+            _ready = true;
+        }
+
+        return _ready;
+    }
+
     bool next() override {
-        if (_index < _relays) {
+        if (_index < _count) {
             auto current = _index;
             ++_index;
-            if ((_index > current) && (_index < _relays)) {
+            if ((_index > current) && (_index < _count)) {
                 _unique_id = "";
                 _topic = "";
                 _message = "";
@@ -337,43 +476,63 @@ public:
     }
 
 private:
+    struct Info {
+        String availability;
+        String payload_available;
+        String payload_not_available;
+        String payload_on;
+        String payload_off;
+    };
+
+    using InfoPtr = std::unique_ptr<Info>;
+    InfoPtr _makeInfo();
+
     Context& _ctx;
     JsonObject* _root { nullptr };
 
-    RelayContext _relay;
-    unsigned char _index { 0u };
-    unsigned char _relays { 0u };
+    InfoPtr _info;
+    size_t _index;
+    size_t _count;
+
+    bool _ready { false };
 
     String _unique_id;
     String _topic;
     String _message;
 };
 
+RelayDiscovery::InfoPtr RelayDiscovery::_makeInfo() {
+    return InfoPtr(
+        new Info{
+            .availability = mqttTopic(MQTT_TOPIC_STATUS),
+            .payload_available = quote(mqttPayloadStatus(true)),
+            .payload_not_available = quote(mqttPayloadStatus(false)),
+            .payload_on = quote(relayPayload(PayloadStatus::On).toString()),
+            .payload_off = quote(relayPayload(PayloadStatus::Off).toString()),
+        });
+}
+
 #endif
 
 // Example payload:
 // {
+//  "state": "ON",
 //  "brightness": 255,
-//  "color_temp": 155,
+//  "color_mode": "rgb",
 //  "color": {
 //    "r": 255,
 //    "g": 180,
 //    "b": 200,
-//    "x": 0.406,
-//    "y": 0.301,
-//    "h": 344.0,
-//    "s": 29.412
 //  },
-//  "effect": "colorloop",
-//  "state": "ON",
 //  "transition": 2,
-//  "white_value": 150
 // }
 
 // Notice that we only support JSON schema payloads, leaving it to the user to configure special
 // per-channel topics, as those don't really fit into the HASS idea of lights controls for a single device
 
 #if LIGHT_PROVIDER != LIGHT_PROVIDER_NONE
+
+static constexpr char Topic[] = MQTT_TOPIC_LIGHT_JSON;
 
 class LightDiscovery : public Discovery {
 public:
@@ -389,8 +548,21 @@ public:
         return *_root;
     }
 
+    bool ready() const override {
+        return _ready;
+    }
+
+    bool prepare() override {
+        if (!_ready) {
+            _count = lightChannels();
+            _ready = true;
+        }
+
+        return _ready;
+    }
+
     bool ok() const override {
-        return true;
+        return _ready && (_count > 0);
     }
 
     bool next() override {
@@ -420,33 +592,44 @@ public:
         if (!_message.length()) {
             auto& json = root();
 
-            json["schema"] = "json";
-            json["uniq_id"] = uniqueId();
+            json[F("schema")] = "json";
+            json[F("uniq_id")] = uniqueId();
 
-            json["name"] = _ctx.name() + ' ' + F("Light");
+            json[F("name")] = _ctx.name() + ' ' + F("Light");
 
-            json["stat_t"] = mqttTopic(MQTT_TOPIC_LIGHT_JSON, false);
-            json["cmd_t"] = mqttTopic(MQTT_TOPIC_LIGHT_JSON, true);
+            json[F("stat_t")] = mqttTopic(Topic);
+            json[F("cmd_t")] = mqttTopicSetter(Topic);
 
-            json["avty_t"] = mqttTopic(MQTT_TOPIC_STATUS, false);
-            json["pl_avail"] = quote(mqttPayloadStatus(true));
-            json["pl_not_avail"] = quote(mqttPayloadStatus(false));
-
-            // send `true` for every payload we support sending / receiving
-            // already enabled by default: "state", "transition"
-
-            json["brightness"] = true;
+            json[F("avty_t")] = mqttTopic(MQTT_TOPIC_STATUS);
+            json[F("pl_avail")] = quote(mqttPayloadStatus(true));
+            json[F("pl_not_avail")] = quote(mqttPayloadStatus(false));
 
             // Note that since we send back the values immediately, HS mode sliders
             // *will jump*, as calculations of input do not always match the output.
             // (especially, when gamma table is used, as we modify the results)
             // In case or RGB, channel values input is expected to match the output exactly.
 
+            // Since 2022.9.x we have a different payload setup
+            // - https://github.com/xoseperez/espurna/issues/2539
+            // - https://github.com/home-assistant/core/blob/2022.9.7/homeassistant/components/mqtt/light/schema_json.py
+            // * ignore 'onoff' and 'brightness'
+            //   both described as 'Must be the only supported mode'
+            // * 'hs' is always supported, but HA UI depends on our setting and
+            //   what gets sent in the json payload
+            // * 'c' and 'w' mean different things depending on *our* context
+            //   'rgbw' - we receive and map to 'w' to our 'warm'
+            //   'rgbww' - we receive and map 'c' to our 'cold' and 'w' to our 'warm'
+            //   'cw' / 'ww' without 'rgb' are not supported; see 'brightness' or 'color_temp'
+            json["brightness"] = true;
+            JsonArray& modes = json.createNestedArray("supported_color_modes");
+
             if (lightHasColor()) {
-                if (lightUseRGB()) {
-                    json["rgb"] = true;
-                } else {
-                    json["hs"] = true;
+                modes.add("hs");
+                modes.add("rgb");
+                if (lightHasWarmWhite() && lightHasColdWhite()) {
+                    modes.add("rgbww");
+                } else if (lightHasWarmWhite()) {
+                    modes.add("rgbw");
                 }
             }
 
@@ -454,12 +637,16 @@ public:
             // (...besides the internally pinned value, ref. MQTT_TOPIC_MIRED. not used here though)
             // - in RGB mode, we convert the temperature into a specific color
             // - in CCT mode, white channels are used
-
-            if (lightHasColor() || lightUseCCT()) {
-                auto range = lightMiredsRange();
+            if (lightHasColor() || lightHasWhite()) {
+                const auto range = lightMiredsRange();
                 json["min_mirs"] = range.cold();
                 json["max_mirs"] = range.warm();
-                json["color_temp"] = true;
+                modes.add("color_temp");
+                modes.add("white");
+            }
+
+            if (!modes.size()) {
+                modes.add("brightness");
             }
 
             json.printTo(_message);
@@ -472,10 +659,40 @@ private:
     Context& _ctx;
     JsonObject* _root { nullptr };
 
+    bool _ready { false };
+    size_t _count;
+
     String _unique_id;
     String _topic;
     String _message;
 };
+
+void heartbeat_rgb(JsonObject& root, JsonObject& color) {
+    const auto rgb = lightRgb();
+
+    color["r"] = rgb.red();
+    color["g"] = rgb.green();
+    color["b"] = rgb.blue();
+
+    if (lightHasWarmWhite() && lightHasColdWhite()) {
+        root["color_mode"] = "rgbww";
+        color["c"] = lightColdWhite();
+        color["w"] = lightWarmWhite();
+    } else if (lightHasWarmWhite()) {
+        root["color_mode"] = "rgbw";
+        color["w"] = lightWarmWhite();
+    } else {
+        root["color_mode"] = "rgb";
+    }
+}
+
+void heartbeat_hsv(JsonObject& root, JsonObject& color) {
+    root["color_mode"] = "hs";
+
+    const auto hsv = lightHsv();
+    color["h"] = hsv.hue();
+    color["s"] = hsv.saturation();
+}
 
 bool heartbeat(heartbeat::Mask mask) {
     // TODO: mask json payload specifically?
@@ -484,27 +701,17 @@ bool heartbeat(heartbeat::Mask mask) {
         DynamicJsonBuffer buffer(512);
         JsonObject& root = buffer.createObject();
 
-        auto state = lightState();
+        const auto state = lightState();
         root["state"] = state ? "ON" : "OFF";
 
         if (state) {
             root["brightness"] = lightBrightness();
-
-            if (lightUseCCT()) {
-                root["white_value"] = lightColdWhite();
-            }
-
-            if (lightColor()) {
+            if (lightHasColor() && lightColor()) {
                 auto& color = root.createNestedObject("color");
                 if (lightUseRGB()) {
-                    auto rgb = lightRgb();
-                    color["r"] = rgb.red();
-                    color["g"] = rgb.green();
-                    color["b"] = rgb.blue();
+                    heartbeat_rgb(root, color);
                 } else {
-                    auto hsv = lightHsv();
-                    color["h"] = hsv.hue();
-                    color["s"] = hsv.saturation();
+                    heartbeat_hsv(root, color);
                 }
             }
         }
@@ -512,8 +719,10 @@ bool heartbeat(heartbeat::Mask mask) {
         String message;
         root.printTo(message);
 
-        String topic = mqttTopic(MQTT_TOPIC_LIGHT_JSON, false);
-        mqttSendRaw(topic.c_str(), message.c_str(), false);
+        static const auto topic = StringView(Topic).toString();
+        mqttSendRaw(
+            mqttTopic(topic).c_str(),
+            message.c_str(), false);
     }
 
     return true;
@@ -523,9 +732,9 @@ void publishLightJson() {
     heartbeat(static_cast<heartbeat::Mask>(heartbeat::Report::Light));
 }
 
-void receiveLightJson(char* payload) {
+void receiveLightJson(StringView payload) {
     DynamicJsonBuffer buffer(1024);
-    JsonObject& root = buffer.parseObject(payload);
+    JsonObject& root = buffer.parseObject(payload.begin());
     if (!root.success()) {
         return;
     }
@@ -534,25 +743,30 @@ void receiveLightJson(char* payload) {
         return;
     }
 
-    auto state = root["state"].as<String>();
-    if (state == F("ON")) {
+    const auto state = root["state"].as<String>();
+
+    if (StringView("ON") == state) {
         lightState(true);
-    } else if (state == F("OFF")) {
+    } else if (StringView("OFF") == state) {
         lightState(false);
     } else {
         return;
     }
 
-    unsigned long transition { lightTransitionTime() };
+    auto transition = lightTransitionTime();
     if (root.containsKey("transition")) {
-        auto seconds = root["transition"].as<float>();
-        if (seconds > 0) {
-            transition = static_cast<unsigned long>(seconds * 1000.0);
+        using LocalUnit = decltype(lightTransitionTime());
+        using RemoteUnit = std::chrono::duration<float>;
+        auto seconds = RemoteUnit(root["transition"].as<float>());
+
+        if (seconds.count() > 0.0f) {
+            transition = std::chrono::duration_cast<LocalUnit>(seconds);
         }
     }
 
     if (root.containsKey("color_temp")) {
-        lightMireds(root["color_temp"].as<long>());
+        const auto mireds = root["color_temp"].as<long>();
+        lightTemperature(light::Mireds{ .value = mireds });
     }
 
     if (root.containsKey("brightness")) {
@@ -561,20 +775,29 @@ void receiveLightJson(char* payload) {
 
     if (lightHasColor() && root.containsKey("color")) {
         JsonObject& color = root["color"];
-        if (lightUseRGB()) {
+        if (color.containsKey("h")
+         && color.containsKey("s"))
+        {
+            lightHs(
+                color["h"].as<long>(),
+                color["s"].as<long>());
+        } else if (color.containsKey("r")
+                && color.containsKey("g")
+                && color.containsKey("b"))
+        {
             lightRgb({
                 color["r"].as<long>(),
                 color["g"].as<long>(),
                 color["b"].as<long>()});
-        } else {
-            lightHs(
-                color["h"].as<long>(),
-                color["s"].as<long>());
         }
-    }
 
-    if (lightUseCCT() && root.containsKey("white_value")) {
-        lightColdWhite(root["white_value"].as<long>());
+        if (color.containsKey("w")) {
+            lightWarmWhite(color["w"].as<long>());
+        }
+
+        if (color.containsKey("c")) {
+            lightColdWhite(color["c"].as<long>());
+        }
     }
 
     lightUpdate({transition, lightTransitionStep()});
@@ -586,10 +809,8 @@ void receiveLightJson(char* payload) {
 
 class SensorDiscovery : public Discovery {
 public:
-    SensorDiscovery() = delete;
     explicit SensorDiscovery(Context& ctx) :
-        _ctx(ctx),
-        _magnitudes(magnitudeCount())
+        _ctx(ctx)
     {}
 
     JsonObject& root() {
@@ -600,8 +821,14 @@ public:
         return *_root;
     }
 
-    bool ok() const {
-        return _index < _magnitudes;
+    bool ready() const override {
+        return _ready;
+    }
+
+    bool ok() const override {
+        return _ready
+            && (_count > 0)
+            && (_index < _count);
     }
 
     const String& topic() override {
@@ -618,12 +845,12 @@ public:
     const String& message() override {
         if (!_message.length()) {
             auto& json = root();
-            json["dev"] = _ctx.device();
-            json["uniq_id"] = uniqueId();
+            json[F("dev")] = _ctx.device();
+            json[F("uniq_id")] = uniqueId();
 
-            json["name"] = _ctx.name() + ' ' + name() + ' ' + localId();
-            json["stat_t"] = mqttTopic(magnitudeTopicIndex(_index).c_str(), false);
-            json["unit_of_meas"] = magnitudeUnits(_index);
+            json[F("name")] = _ctx.name() + ' ' + name() + ' ' + localId();
+            json[F("stat_t")] = mqttTopic(_info.topic);
+            json[F("unit_of_meas")] = magnitudeUnitsName(_info.units);
 
             json.printTo(_message);
         }
@@ -633,14 +860,14 @@ public:
 
     const String& name() {
         if (!_name.length()) {
-            _name = magnitudeTopic(magnitudeType(_index));
+            _name = magnitudeTypeTopic(_info.type);
         }
 
         return _name;
     }
 
-    unsigned char localId() const {
-        return magnitudeIndex(_index);
+    String localId() const {
+        return String(_info.index, 10);
     }
 
     const String& uniqueId() {
@@ -651,11 +878,30 @@ public:
         return _unique_id;
     }
 
+    bool prepare() override {
+        if (!_ready) {
+            _ready = sensorReady();
+            if (!_ready) {
+                return false;
+            }
+
+            _count = magnitudeCount();
+            _index = 0;
+
+            if (_count > 0) {
+                _info = magnitudeInfo(_index);
+            }
+        }
+
+        return _ready;
+    }
+
     bool next() override {
-        if (_index < _magnitudes) {
+        if (_index < _count) {
             auto current = _index;
             ++_index;
-            if ((_index > current) && (_index < _magnitudes)) {
+            if ((_index > current) && (_index < _count)) {
+                _info = magnitudeInfo(_index);
                 _unique_id = "";
                 _name = "";
                 _topic = "";
@@ -671,8 +917,10 @@ private:
     Context& _ctx;
     JsonObject* _root { nullptr };
 
-    unsigned char _index { 0u };
-    unsigned char _magnitudes { 0u };
+    sensor::Info _info;
+    size_t _count;
+    size_t _index;
+    bool _ready { false };
 
     String _unique_id;
     String _name;
@@ -682,20 +930,185 @@ private:
 
 #endif
 
-// Reworked discovery class. Try to send and wait for MQTT QoS 1 publish ACK to continue.
-// Topic and message are generated on demand and most of JSON payload is cached for re-use to save RAM.
+DevicePtr make_device_ptr() {
+    return std::make_unique<Device>(
+        make_config_strings(),
+        make_build_strings());
+}
 
+Context make_context() {
+    return Context(make_device_ptr(), 2048);
+}
+
+// use 5 retries and set a specific duration for each attempt
+using Durations = std::array<duration::Milliseconds, 5>;
+
+#if __cplusplus >= 201703L
+#define __CONSTEXPR constexpr
+#else
+#define __CONSTEXPR
+#endif
+
+struct Wait {
+    using Value = typename Durations::value_type;
+
+    __CONSTEXPR Wait(const Durations& base) :
+        _begin(std::begin(base)),
+        _end(std::end(base)),
+        _it(_begin)
+    {}
+
+    void reset() {
+        _it = _begin;
+    }
+
+    Value value() const {
+        return *_it;
+    }
+
+    void change_next() {
+        _it = next_it(_it);
+    }
+
+    bool try_next() {
+        auto current = _it;
+        change_next();
+        return current != _it;
+    }
+
+    Value next() {
+        change_next();
+        return value();
+    }
+
+    __CONSTEXPR Value first() const {
+        return *_begin;
+    }
+
+    bool is_first() const {
+        return _it == _begin;
+    }
+
+    __CONSTEXPR Value last() const {
+        return *_end;
+    }
+
+    bool is_last() const {
+        return _it == _end;
+    }
+
+    __CONSTEXPR size_t count() const {
+        return _end - _begin;
+    }
+
+private:
+    using Iterator = Durations::const_iterator;
+
+    Iterator next_it(Iterator value) {
+        const auto next = value + 1;
+        if (next < _end) {
+            return next;
+        }
+
+        return value;
+    }
+
+    Iterator _begin;
+    Iterator _end;
+    Iterator _it;
+};
+
+#undef __CONSTEXPR
+
+// intervals between send attempts, usually long enough to push data to the network stack
+static constexpr Durations ShortDurations{{
+    duration::Milliseconds{ 100 },
+    duration::Milliseconds{ 500 },
+    duration::Milliseconds{ 1000 },
+    duration::Milliseconds{ 2500 },
+    duration::Milliseconds{ 5000 },
+}};
+
+// longer intervals between initialization attempts, give enough time for external things
+static constexpr Durations LongDurations{{
+    duration::Seconds{ 5 },
+    duration::Seconds{ 10 },
+    duration::Seconds{ 15 },
+    duration::Seconds{ 30 },
+    duration::Seconds{ 60 },
+}};
+
+struct Result {
+    using Duration = duration::Milliseconds;
+
+    enum class Value {
+        Error,
+        Ok,
+        Retry,
+    };
+
+    Result(Duration wait, Value value) :
+        _wait(wait),
+        _value(value)
+    {}
+
+    explicit Result(Duration wait) :
+        Result(wait, Value::Ok)
+    {}
+
+    Result() :
+        Result(ShortDurations.front())
+    {}
+
+    bool ok() const {
+        return _value == Value::Ok;
+    }
+
+    bool retry() const {
+        return _value == Value::Retry;
+    }
+
+    explicit operator bool() const {
+        return ok();
+    }
+
+    Duration wait() const {
+        return _wait;
+    }
+
+private:
+    Duration _wait;
+    Value _value;
+};
+
+Result next_retry(Wait& wait) {
+    const auto retry = wait.is_last()
+        ? Result::Value::Error
+        : Result::Value::Retry;
+
+    const auto value = wait.value();
+    wait.try_next();
+
+    return Result(value, retry);
+}
+
+// Topic and message are generated on demand and most of JSON payload is cached for re-use to save RAM.
 class DiscoveryTask {
 public:
     using Entity = std::unique_ptr<Discovery>;
     using Entities = std::forward_list<Entity>;
 
-    static constexpr int Retries { 5 };
-    static constexpr unsigned long WaitShortMs { 100ul };
-    static constexpr unsigned long WaitLongMs { 1000ul };
+    DiscoveryTask() = delete;
 
-    DiscoveryTask(bool enabled) :
-        _enabled(enabled)
+    DiscoveryTask(const DiscoveryTask&) = delete;
+    DiscoveryTask& operator=(const DiscoveryTask&) = delete;
+
+    DiscoveryTask(DiscoveryTask&&) = delete;
+    DiscoveryTask& operator=(DiscoveryTask&&) = delete;
+
+    DiscoveryTask(Context ctx, State state) :
+        _ctx(std::move(ctx)),
+        _state(state)
     {}
 
     void add(Entity&& entity) {
@@ -707,12 +1120,8 @@ public:
         _entities.push_front(std::make_unique<T>(_ctx));
     }
 
-    bool retry() {
-        if (_retry < 0) {
-            return false;
-        }
-
-        return (--_retry > 0);
+    Result retry_send() {
+        return next_retry(_wait_short);
     }
 
     Context& context() {
@@ -723,236 +1132,408 @@ public:
         return _entities.empty();
     }
 
-    bool ok() const {
-        if ((_retry > 0) && !_entities.empty()) {
-            auto& entity = _entities.front();
-            return entity->ok();
-        }
-
-        return false;
+    State state() const {
+        return _state;
     }
 
     template <typename T>
-    bool send(T&& action) {
-        while (!_entities.empty()) {
-            auto& entity = _entities.front();
-            if (!entity->ok()) {
-                _entities.pop_front();
-                _ctx.reset();
-                continue;
-            }
+    Result try_send_one(T&& action);
 
-            const auto* topic = entity->topic().c_str();
-            const auto* msg = _enabled
-                ? entity->message().c_str()
-                : "";
-
-            if (action(topic, msg)) {
-                if (!entity->next()) {
-                    _retry = Retries;
-                    _entities.pop_front();
-                    _ctx.reset();
-                }
-                return true;
-            }
-
-            return false;
-        }
-
-        return false;
-    }
+    Result prepare_all();
 
 private:
-    bool _enabled { false };
+    Result next_send() {
+        _wait_short.reset();
+        return Result(_wait_short.value());
+    }
 
-    int _retry { Retries };
-    Context _ctx { makeContext() };
+    Result stop_sending() {
+        return Result(
+            _wait_short.first(),
+            Result::Value::Error);
+    }
+
+    Context _ctx;
+
+    State _state;
     Entities _entities;
+
+    Wait _wait_short { ShortDurations };
+    Wait _wait_long { LongDurations };
 };
+
+Result DiscoveryTask::prepare_all() {
+    bool prepared { true };
+    for (auto& entity : _entities) {
+        if (!entity->prepare()) {
+            prepared = false;
+            break;
+        }
+    }
+
+    if (!prepared) {
+        return next_retry(_wait_long);
+    }
+
+    return Result();
+}
+
+template <typename T>
+Result DiscoveryTask::try_send_one(T&& action) {
+    auto it = _entities.begin();
+
+    while (it != _entities.end()) {
+        if (!(*it)->ok()) {
+            it = _entities.erase_after(
+                _entities.before_begin());
+            _ctx.reset();
+            continue;
+        }
+
+        const auto* topic = (*it)->topic().c_str();
+        const auto* msg = (State::Enabled == _state)
+            ? (*it)->message().c_str()
+            : "";
+
+        if (action(topic, msg)) {
+            if (!(*it)->next()) {
+                it = _entities.erase_after(
+                    _entities.before_begin());
+                _ctx.reset();
+            }
+
+            return next_send();
+        }
+
+        return retry_send();
+    }
+
+    return stop_sending();
+}
+
+using DiscoveryPtr = std::shared_ptr<DiscoveryTask>;
+using FlagPtr = std::shared_ptr<bool>;
+
+DiscoveryPtr makeDiscovery(State);
 
 namespace internal {
 
-using TaskPtr = std::shared_ptr<DiscoveryTask>;
-using FlagPtr = std::shared_ptr<bool>;
+bool enabled { build::enabled() };
+bool retain { build::retain() };
 
-bool retain { false };
-bool enabled { false };
+String birthTopic;
 
-enum class State {
-    Initial,
-    Pending,
-    Sent
-};
+timer::SystemTimer task;
 
-State state { State::Initial };
-Ticker timer;
+void send(DiscoveryPtr, FlagPtr);
 
-void send(TaskPtr ptr, FlagPtr flag_ptr);
+void schedule(duration::Milliseconds wait, DiscoveryPtr ptr, FlagPtr flag_ptr) {
+    task.schedule_once(
+        wait,
+        [ptr, flag_ptr]() {
+            send(ptr, flag_ptr);
+        });
+}
 
-void stop(bool done) {
-    timer.detach();
-    if (done) {
-        DEBUG_MSG_P(PSTR("[HA] Stopping discovery\n"));
-        state = State::Sent;
-    } else {
-        DEBUG_MSG_P(PSTR("[HA] Discovery error\n"));
-        state = State::Pending;
+void stop() {
+    DEBUG_MSG_P(PSTR("[HA] Stopping discovery\n"));
+    internal::task.stop();
+}
+
+void send(DiscoveryPtr discovery, FlagPtr flag_ptr) {
+    if (!mqttConnected() || discovery->done()) {
+        stop();
+        return;
     }
-}
 
-void schedule(unsigned long wait, TaskPtr ptr, FlagPtr flag_ptr) {
-    internal::timer.once_ms_scheduled(wait, [ptr, flag_ptr]() {
-        send(ptr, flag_ptr);
-    });
-}
+    auto ready = discovery->prepare_all();
+    if (!ready) {
+        if (ready.retry()) {
+            DEBUG_MSG_P(PSTR("[HA] Discovery not ready, retrying in %zu (ms)\n"),
+                ready.wait().count());
+            schedule(ready.wait(), discovery, flag_ptr);
+        } else {
+            stop();
+        }
 
-void schedule(TaskPtr ptr, FlagPtr flag_ptr) {
-    schedule(DiscoveryTask::WaitShortMs, ptr, flag_ptr);
-}
-
-void schedule(TaskPtr ptr) {
-    schedule(DiscoveryTask::WaitShortMs, ptr, std::make_shared<bool>(true));
-}
-
-void send(TaskPtr ptr, FlagPtr flag_ptr) {
-    auto& task = *ptr;
-    if (!mqttConnected() || task.done()) {
-        stop(true);
         return;
     }
 
     auto& flag = *flag_ptr;
     if (!flag) {
-        if (task.retry()) {
-            schedule(ptr, flag_ptr);
+        const auto next_send = discovery->retry_send();
+        if (next_send.retry()) {
+            schedule(next_send.wait(), discovery, flag_ptr);
         } else {
-            stop(false);
+            stop();
         }
         return;
     }
 
     uint16_t pid { 0u };
-    auto res = task.send([&](const char* topic, const char* message) {
-        pid = ::mqttSendRaw(topic, message, internal::retain, 1);
-        return pid > 0;
-    });
+    const auto sent = discovery->try_send_one(
+        [&](const char* topic, const char* message) {
+            pid = ::mqttSendRaw(topic, message, internal::retain, 1);
+            return pid > 0;
+        });
 
 #if MQTT_LIBRARY == MQTT_LIBRARY_ASYNCMQTTCLIENT
-    // - async fails when disconneted and when it's buffers are filled, which should be resolved after $LATENCY
-    // and the time it takes for the lwip to process it. future versions use queue, but could still fail when low on RAM
-    // - lwmqtt will fail when disconnected (already checked above) and *will* disconnect in case publish fails.
-    // ::publish() will wait for the puback, so we don't have to do it ourselves. not tested.
-    // - pubsub will fail when it can't buffer the payload *or* the underlying WiFiClient calls fail. also not tested.
+    // Receive acknowledgement from the broker before continuing.
+    // Usually a good idea in general, to avoid filling network buffers too quickly.
+    //
+    // Not needed with LWMQTT, as it is already handled and wrapped in Result
+    // Not supported by PubSubClient
 
-    if (res) {
+    if (sent) {
         flag = false;
-        mqttOnPublish(pid, [flag_ptr]() {
-            (*flag_ptr) = true;
-        });
+        mqttOnPublish(
+            pid,
+            [flag_ptr]() {
+                (*flag_ptr) = true;
+            });
     }
 #endif
 
-    auto wait = res
-        ? DiscoveryTask::WaitShortMs
-        : DiscoveryTask::WaitLongMs;
-
-    if (res || task.retry()) {
-        schedule(wait, ptr, flag_ptr);
+    if (sent.ok() || sent.retry()) {
+        schedule(sent.wait(), discovery, flag_ptr);
         return;
     }
 
-    stop(false);
+    if (!sent) {
+        stop();
+    }
 }
 
 } // namespace internal
 
-void publishDiscovery() {
-    if (!mqttConnected() || internal::timer.active() || (internal::state != internal::State::Pending)) {
-        return;
-    }
-
-    auto task = std::make_shared<DiscoveryTask>(internal::enabled);
+DiscoveryPtr makeDiscovery(State state) {
+    auto discovery = std::make_shared<DiscoveryTask>(
+        make_context(), state);
 
 #if LIGHT_PROVIDER != LIGHT_PROVIDER_NONE
-    task->add<LightDiscovery>();
+    discovery->add<LightDiscovery>();
 #endif
 #if RELAY_SUPPORT
-    task->add<RelayDiscovery>();
+    discovery->add<RelayDiscovery>();
 #endif
 #if SENSOR_SUPPORT
-    task->add<SensorDiscovery>();
+    discovery->add<SensorDiscovery>();
 #endif
 
-    // only happens when nothing is configured to do the add()
-    if (task->done()) {
+    return discovery;
+}
+
+void scheduleDiscovery(duration::Milliseconds duration, DiscoveryPtr discovery) {
+    DEBUG_MSG_P(PSTR("[HA] Starting discovery\n"));
+    internal::schedule(duration, discovery, std::make_shared<bool>(true));
+}
+
+void scheduleDiscovery(DiscoveryPtr discovery) {
+    scheduleDiscovery(ShortDurations.front(), discovery);
+}
+
+void publishDiscoveryForState(State state) {
+    if (!mqttConnected()) {
         return;
     }
 
-    internal::schedule(task);
+    auto discovery = makeDiscovery(state);
+
+    // only happens when nothing is configured to do the add()
+    if (discovery->done()) {
+        DEBUG_MSG_P(PSTR("[HA] No discovery task(s) available\n"));
+        return;
+    }
+
+    scheduleDiscovery(discovery);
+}
+
+void publishDiscoveryForState(bool state) {
+    publishDiscoveryForState(
+        state
+            ? State::Enabled
+            : State::Disabled);
+}
+
+void publishDiscoveryForCurrentState() {
+    publishDiscoveryForState(internal::enabled);
 }
 
 void configure() {
-    bool current = internal::enabled;
-    internal::enabled = getSetting("haEnabled", 1 == HOMEASSISTANT_ENABLED);
-    internal::retain = getSetting("haRetain", 1 == HOMEASSISTANT_RETAIN);
-
-    if (internal::enabled != current) {
-        internal::state = internal::State::Pending;
+    auto birthTopic = settings::birthTopic();
+    const auto birthChanged = birthTopic != internal::birthTopic;
+    if (mqttConnected() && birthChanged) {
+        if (internal::birthTopic.length()) {
+            mqttUnsubscribeRaw(internal::birthTopic.c_str());
+        }
+        if (birthTopic.length()) {
+            mqttSubscribeRaw(birthTopic.c_str());
+        }
     }
 
-    homeassistant::publishDiscovery();
+    if (birthChanged) {
+        internal::birthTopic = std::move(birthTopic);
+    }
+
+    internal::retain = settings::retain();
+
+    const auto current = internal::enabled;
+    internal::enabled = settings::enabled();
+
+    if (mqttConnected() && (current != internal::enabled)) {
+        publishDiscoveryForState(current);
+    }
 }
 
-void mqttCallback(unsigned int type, const char* topic, char* payload) {
+namespace mqtt {
+
+void onDisconnected() {
+    internal::task.stop();
+}
+
+void onConnected() {
+#if LIGHT_PROVIDER != LIGHT_PROVIDER_NONE
+    ::mqttSubscribe(Topic);
+#endif
+    ::espurnaRegisterOnce(publishDiscoveryForCurrentState);
+    if (internal::birthTopic.length()) {
+        ::mqttSubscribeRaw(internal::birthTopic.c_str());
+    }
+}
+
+void onMessage(StringView topic, StringView payload) {
+#if LIGHT_PROVIDER != LIGHT_PROVIDER_NONE
+    auto t = ::mqttMagnitude(topic);
+    if (t.equals(Topic)) {
+        receiveLightJson(payload);
+        return;
+    }
+#endif
+
+    if ((topic == internal::birthTopic)
+     && (payload == settings::birthPayload()))
+    {
+        publishDiscoveryForCurrentState();
+    }
+}
+
+void callback(unsigned int type, StringView topic, StringView payload) {
     if (MQTT_DISCONNECT_EVENT == type) {
-        if (internal::state == internal::State::Sent) {
-            internal::state = internal::State::Pending;
-        }
-        internal::timer.detach();
+        onDisconnected();
         return;
     }
 
     if (MQTT_CONNECT_EVENT == type) {
-#if LIGHT_PROVIDER != LIGHT_PROVIDER_NONE
-        ::mqttSubscribe(MQTT_TOPIC_LIGHT_JSON);
-#endif
-        ::schedule_function(publishDiscovery);
+        onConnected();
         return;
     }
 
-#if LIGHT_PROVIDER != LIGHT_PROVIDER_NONE
     if (type == MQTT_MESSAGE_EVENT) {
-        String t = ::mqttMagnitude(topic);
-        if (t.equals(MQTT_TOPIC_LIGHT_JSON)) {
-            receiveLightJson(payload);
-        }
+        onMessage(topic, payload);
         return;
     }
-#endif
 }
+
+} // namespace mqtt
 
 namespace web {
 
 #if WEB_SUPPORT
 
+void onAction(uint32_t, const char* action, JsonObject& data) {
+    STRING_VIEW_INLINE(Publish, "ha-publish");
+    STRING_VIEW_INLINE(State, "state");
+
+    if ((Publish == action) && data.containsKey(State)) {
+        publishDiscoveryForState(data[State].as<bool>());
+        return;
+    }
+}
+
 void onVisible(JsonObject& root) {
-    root["haVisible"] = 1;
+    wsPayloadModule(root, settings::query::Prefix);
 }
 
 void onConnected(JsonObject& root) {
-    root["haPrefix"] = getSetting("haPrefix", HOMEASSISTANT_PREFIX);
-    root["haEnabled"] = getSetting("haEnabled", 1 == HOMEASSISTANT_ENABLED);
-    root["haRetain"] = getSetting("haRetain", 1 == HOMEASSISTANT_RETAIN);
+    root[settings::keys::Enabled] = settings::enabled();
+    root[settings::keys::Prefix] = settings::prefix();
+    root[settings::keys::Retain] = settings::retain();
+    root[settings::keys::BirthTopic] = settings::birthTopic();
+    root[settings::keys::BirthPayload] = settings::birthPayload();
 }
 
-bool onKeyCheck(const char* key, JsonVariant& value) {
-    return (strncmp(key, "ha", 2) == 0);
+bool onKeyCheck(StringView key, const JsonVariant&) {
+    return settings::query::checkSamePrefix(key);
 }
 
 #endif
 
 } // namespace web
+
+#if TERMINAL_SUPPORT
+namespace terminal {
+
+STRING_VIEW_INLINE(Dump, "HA");
+
+void dump(::terminal::CommandContext&& ctx) {
+    settingsDump(ctx, settings::query::Settings);
+}
+
+STRING_VIEW_INLINE(Send, "HA.SEND");
+
+void send(::terminal::CommandContext&& ctx) {
+    publishDiscoveryForState(State::Enabled);
+    terminalOK(ctx);
+}
+
+STRING_VIEW_INLINE(Clear, "HA.CLEAR");
+
+void clear(::terminal::CommandContext&& ctx) {
+    publishDiscoveryForState(State::Disabled);
+    terminalOK(ctx);
+}
+
+static constexpr ::terminal::Command Commands[] PROGMEM {
+    {Dump, dump},
+    {Clear, clear},
+    {Send, send},
+};
+
+void setup() {
+    espurna::terminal::add(Commands);
+}
+
+} // namespace terminal
+#endif
+
+void setup() {
+#if WEB_SUPPORT
+    wsRegister()
+        .onAction(web::onAction)
+        .onVisible(web::onVisible)
+        .onConnected(web::onConnected)
+        .onKeyCheck(web::onKeyCheck);
+#endif
+
+#if LIGHT_PROVIDER != LIGHT_PROVIDER_NONE
+    lightOnReport(publishLightJson);
+    mqttHeartbeat(heartbeat);
+#endif
+    mqttRegister(mqtt::callback);
+
+#if TERMINAL_SUPPORT
+    terminal::setup();
+#endif
+
+    settings::query::setup();
+
+    espurnaRegisterReload(configure);
+    configure();
+}
+
+} // namespace
 } // namespace homeassistant
+} // namespace espurna
 
 // This module no longer implements .yaml generation, since we can't:
 // - use unique_id in the device config
@@ -961,30 +1542,7 @@ bool onKeyCheck(const char* key, JsonVariant& value) {
 //   (yet? needs reworked configuration section or making functions read settings directly)
 
 void haSetup() {
-#if WEB_SUPPORT
-    wsRegister()
-        .onVisible(homeassistant::web::onVisible)
-        .onConnected(homeassistant::web::onConnected)
-        .onKeyCheck(homeassistant::web::onKeyCheck);
-#endif
-
-#if LIGHT_PROVIDER != LIGHT_PROVIDER_NONE
-    lightSetReportListener(homeassistant::publishLightJson);
-    mqttHeartbeat(homeassistant::heartbeat);
-#endif
-    mqttRegister(homeassistant::mqttCallback);
-
-#if TERMINAL_SUPPORT
-    terminalRegisterCommand(F("HA.SEND"), [](const terminal::CommandContext& ctx) {
-        using namespace homeassistant::internal;
-        state = State::Pending;
-        homeassistant::publishDiscovery();
-        terminalOK(ctx);
-    });
-#endif
-
-    espurnaRegisterReload(homeassistant::configure);
-    homeassistant::configure();
+    espurna::homeassistant::setup();
 }
 
 #endif // HOMEASSISTANT_SUPPORT

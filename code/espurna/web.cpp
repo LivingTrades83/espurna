@@ -6,18 +6,13 @@ Copyright (C) 2016-2019 by Xose Pérez <xose dot perez at gmail dot com>
 
 */
 
-#include "web.h"
+#include "espurna.h"
 
 #if WEB_SUPPORT
 
 #include <algorithm>
 #include <functional>
 #include <memory>
-
-#include "system.h"
-#include "settings.h"
-#include "utils.h"
-#include "ntp.h"
 
 #include <Schedule.h>
 #include <Print.h>
@@ -28,29 +23,40 @@ Copyright (C) 2016-2019 by Xose Pérez <xose dot perez at gmail dot com>
 #include <ESPAsyncWebServer.h>
 #include <AsyncJson.h>
 
+#include "ntp.h"
+#include "settings.h"
+#include "system.h"
+#include "utils.h"
+#include "web.h"
+#include "ws.h"
+
 #if WEB_EMBEDDED
 
+namespace {
+
 #if WEBUI_IMAGE == WEBUI_IMAGE_SMALL
-    #include "static/index.small.html.gz.h"
+    #include "static/index.small.html.ipp"
 #elif WEBUI_IMAGE == WEBUI_IMAGE_LIGHT
-    #include "static/index.light.html.gz.h"
+    #include "static/index.light.html.ipp"
 #elif WEBUI_IMAGE == WEBUI_IMAGE_SENSOR
-    #include "static/index.sensor.html.gz.h"
+    #include "static/index.sensor.html.ipp"
 #elif WEBUI_IMAGE == WEBUI_IMAGE_RFBRIDGE
-    #include "static/index.rfbridge.html.gz.h"
+    #include "static/index.rfbridge.html.ipp"
 #elif WEBUI_IMAGE == WEBUI_IMAGE_RFM69
-    #include "static/index.rfm69.html.gz.h"
+    #include "static/index.rfm69.html.ipp"
 #elif WEBUI_IMAGE == WEBUI_IMAGE_LIGHTFOX
-    #include "static/index.lightfox.html.gz.h"
+    #include "static/index.lightfox.html.ipp"
 #elif WEBUI_IMAGE == WEBUI_IMAGE_GARLAND
-    #include "static/index.garland.html.gz.h"
+    #include "static/index.garland.html.ipp"
 #elif WEBUI_IMAGE == WEBUI_IMAGE_THERMOSTAT
-    #include "static/index.thermostat.html.gz.h"
+    #include "static/index.thermostat.html.ipp"
 #elif WEBUI_IMAGE == WEBUI_IMAGE_CURTAIN
-    #include "static/index.curtain.html.gz.h"
+    #include "static/index.curtain.html.ipp"
 #elif WEBUI_IMAGE == WEBUI_IMAGE_FULL
-    #include "static/index.all.html.gz.h"
+    #include "static/index.all.html.ipp"
 #endif
+
+} // namespace
 
 #endif // WEB_EMBEDDED
 
@@ -59,18 +65,111 @@ Copyright (C) 2016-2019 by Xose Pérez <xose dot perez at gmail dot com>
 #include "static/server.key.h"
 #endif // WEB_SSL_ENABLED
 
+namespace espurna {
+namespace web {
+namespace {
 
-AsyncWebPrint::AsyncWebPrint(const AsyncWebPrintConfig& config, AsyncWebServerRequest* request) :
-    mimeType(config.mimeType),
-    backlogCountMax(config.backlogCountMax),
-    backlogSizeMax(config.backlogSizeMax),
-    backlogTimeout(config.backlogTimeout),
-    _request(request),
-    _state(State::None)
-{}
+namespace build {
 
-bool AsyncWebPrint::_addBuffer() {
-    if ((_buffers.size() + 1) > backlogCountMax) {
+STRING_VIEW_INLINE(WebRemoteDomain, WEB_REMOTE_DOMAIN);
+
+constexpr auto DefaultPort = uint16_t{
+#if WEB_SSL_ENABLED
+        443
+#else
+        80
+#endif
+};
+
+constexpr uint16_t port() {
+    return (WEB_PORT == 0)
+        ? DefaultPort
+        : (WEB_PORT);
+}
+
+constexpr bool access_log() {
+    return 1 == WEB_ACCESS_LOG;
+}
+
+} // namespace build
+
+namespace settings {
+namespace keys {
+
+STRING_VIEW_INLINE(Prefix, "web");
+
+STRING_VIEW_INLINE(AccessLog, "webAccessLog");
+STRING_VIEW_INLINE(Domain, "webDomain");
+STRING_VIEW_INLINE(Port, "webPort");
+
+} // namespace keys
+
+bool access_log() {
+    return getSetting(keys::AccessLog, build::access_log());
+}
+
+String domain() {
+    return getSetting(keys::Domain, build::WebRemoteDomain);
+}
+
+uint16_t port() {
+    return getSetting(keys::Port, build::port());
+}
+
+} // namespace settings
+} // namespace
+} // namespace web
+} // namespace espurna
+
+namespace {
+
+static constexpr size_t WebConfigBufferMax { 4096 };
+
+template <typename T>
+void _addHeader(T& other, espurna::StringView name, espurna::StringView value) {
+    other.addHeader(name.toString(), value.toString());
+}
+
+void _addConnectionClose(AsyncWebServerResponse* response) {
+    _addHeader(*response,
+        STRING_VIEW("Connection"), STRING_VIEW("close"));
+}
+
+void _addSecurityHeaders(AsyncWebServerResponse* response) {
+    _addHeader(*response,
+        STRING_VIEW("X-XSS-Protection"),
+        STRING_VIEW("1; mode=block"));
+    _addHeader(*response,
+        STRING_VIEW("X-Content-Type-Options"),
+        STRING_VIEW("nosniff"));
+    _addHeader(*response,
+        STRING_VIEW("X-Frame-Options"),
+        STRING_VIEW("deny"));
+}
+
+#if WEB_EMBEDDED
+static constexpr auto WebContentEncoding = espurna::StringView(webui_content_encoding);
+static constexpr auto WebLastModified = espurna::StringView(webui_last_modified);
+
+void _addGenericHeaders(AsyncWebServerResponse* response) {
+    if (WebContentEncoding.length()) {
+        _addHeader(*response,
+            STRING_VIEW("Content-Encoding"), WebContentEncoding);
+    }
+
+    _addHeader(*response,
+        STRING_VIEW("Last-Modified"), WebLastModified);
+}
+#endif
+
+} // namespace
+
+namespace espurna {
+namespace web {
+namespace print {
+
+bool RequestPrint::_addBuffer() {
+    if ((_buffers.size() + 1) > _config.backlog.count) {
         if (!_exhaustBuffers()) {
             _state = State::Error;
             return false;
@@ -79,7 +178,7 @@ bool AsyncWebPrint::_addBuffer() {
 
     // Note: c++17, emplace returns created object reference
     //       c++11, we need to use .back()
-    _buffers.emplace_back(backlogSizeMax, 0);
+    _buffers.emplace_back(_config.backlog.size, 0);
     _buffers.back().clear();
 
     return true;
@@ -90,63 +189,59 @@ bool AsyncWebPrint::_addBuffer() {
 // This API expects a **very** careful approach to context switching between SYS and CONT:
 // - Returning RESPONSE_TRY_AGAIN before buffers are filled will result in invalid size marker being sent on the wire.
 //   HTTP client (curl, python requests etc., as discovered in testing) will then drop the connection
-// - Returning 0 will immediatly close the connection from our side
+// - Returning 0 will immediately close the connection from our side
 // - Calling _prepareRequest() **before** _buffers are filled will result in returning 0
-// - Calling yield() / delay() while request AsyncWebPrint is active **may** trigger this callback out of sequence
-//   (e.g. Serial.print(..), DEBUG_MSG(...), or any other API trying to switch contexts)
+// - Calling yield() / delay() while request handler is active **may** trigger this callback out of sequence
+//   (e.g. Stream.write(...), Stream.read(...), DEBUG_MSG(...), or any other API trying to switch contexts)
 // - Receiving data (tcp ack from the previous packet) **will** trigger the callback when switching contexts.
 
-void AsyncWebPrint::_prepareRequest() {
+size_t RequestPrint::_handleRequest(uint8_t* data, size_t maxLen) {
+    switch (_state) {
+    case State::None:
+        return RESPONSE_TRY_AGAIN;
+    case State::Error:
+    case State::Done:
+        return 0;
+    case State::Sending:
+        break;
+    }
+
+    size_t written = 0;
+    while ((written < maxLen) && !_buffers.empty()) {
+        auto& chunk =_buffers.front();
+        auto have = maxLen - written;
+        if (chunk.size() > have) {
+            std::copy(chunk.data(), chunk.data() + have, data + written);
+            chunk.erase(chunk.begin(), chunk.begin() + have);
+            written += have;
+        } else {
+            std::copy(chunk.data(), chunk.data() + chunk.size(), data + written);
+            _buffers.pop_front();
+            written += chunk.size();
+        }
+    }
+
+    return written;
+}
+
+void RequestPrint::_prepareRequest() {
     _state = State::Sending;
 
-    auto *response = _request->beginChunkedResponse(mimeType, [this](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
-        switch (_state) {
-        case State::None:
-            return RESPONSE_TRY_AGAIN;
-        case State::Error:
-        case State::Done:
-            return 0;
-        case State::Sending:
-            break;
-        }
+    auto *response = _request->beginChunkedResponse(
+        _config.mimeType,
+        [this](uint8_t*data, size_t maxLen, size_t) -> size_t {
+            return this->_handleRequest(data, maxLen);
+        });
 
-        size_t written = 0;
-        while ((written < maxLen) && !_buffers.empty()) {
-            auto& chunk =_buffers.front();
-            auto have = maxLen - written;
-            if (chunk.size() > have) {
-                std::copy(chunk.data(), chunk.data() + have, buffer + written);
-                chunk.erase(chunk.begin(), chunk.begin() + have);
-                written += have;
-            } else {
-                std::copy(chunk.data(), chunk.data() + chunk.size(), buffer + written);
-                _buffers.pop_front();
-                written += chunk.size();
-            }
-        }
-
-
-        return written;
-    });
-
-    response->addHeader("Connection", "close");
+    _addConnectionClose(response);
     _request->send(response);
 }
 
-void AsyncWebPrint::setState(State state) {
-    _state = state;
+size_t RequestPrint::write(uint8_t b) {
+    return write(&b, 1);
 }
 
-AsyncWebPrint::State AsyncWebPrint::getState() {
-    return _state;
-}
-
-size_t AsyncWebPrint::write(uint8_t b) {
-    const uint8_t tmp[1] {b};
-    return write(tmp, 1);
-}
-
-bool AsyncWebPrint::_exhaustBuffers() {
+bool RequestPrint::_exhaustBuffers() {
     // XXX: espasyncwebserver will trigger write callback if we setup response too early
     //      exploring code, callback handler responds to a special return value RESPONSE_TRY_AGAIN
     //      but, it seemingly breaks chunked response logic
@@ -155,9 +250,11 @@ bool AsyncWebPrint::_exhaustBuffers() {
         _prepareRequest();
     }
 
-    const auto start = millis();
+    using TimeSource = espurna::time::CoreClock;
+    const auto start = TimeSource::now();
+
     do {
-        if (millis() - start > 5000) {
+        if (TimeSource::now() - start > _config.backlog.timeout) {
             _buffers.clear();
             break;
         }
@@ -167,12 +264,12 @@ bool AsyncWebPrint::_exhaustBuffers() {
     return _buffers.empty();
 }
 
-void AsyncWebPrint::flush() {
+void RequestPrint::flush() {
     _exhaustBuffers();
     _state = State::Done;
 }
 
-size_t AsyncWebPrint::write(const uint8_t* data, size_t size) {
+size_t RequestPrint::write(const uint8_t* data, size_t size) {
     if (_state == State::Error) {
         return 0;
     }
@@ -204,60 +301,137 @@ size_t AsyncWebPrint::write(const uint8_t* data, size_t size) {
     return full_size;
 }
 
+} // namespace print
+} // namespace web
+} // namespace espurna
+
 // -----------------------------------------------------------------------------
 
-AsyncWebServer* _server;
-char _last_modified[50];
-std::vector<uint8_t> * _webConfigBuffer;
-bool _webConfigSuccess = false;
+namespace espurna {
+namespace web {
+namespace {
 
-std::vector<web_request_callback_f> _web_request_callbacks;
-std::vector<web_body_callback_f> _web_body_callbacks;
+uint16_t port{};
+AsyncWebServer* server;
 
-constexpr unsigned long WebConfigBufferMax { 4096ul };
+// XXX shared between requests!
+std::unique_ptr<std::vector<uint8_t>> config_buffer;
+bool config_success = false;
+
+// TODO server may not cache the full body
+std::vector<web_request_callback_f> request_callbacks;
+std::vector<web_body_callback_f> body_callbacks;
+
+} // namespace
+} // namespace web
+} // namespace espurna
 
 // -----------------------------------------------------------------------------
 // HOOKS
 // -----------------------------------------------------------------------------
 
+namespace {
+
+bool _authenticateRequest(AsyncWebServerRequest* request) {
+#if USE_PASSWORD
+    return request->authenticate(WEB_USERNAME, systemPassword().c_str());
+#else
+    return true;
+#endif
+}
+
+// Whether the request is for this hostname or IP
+bool _isAPModeRequest(AsyncWebServerRequest* request) {
+    if (wifiConnectable()) {
+        const auto direct = request->client()->localIP() == wifiApIp();
+        if (!direct) {
+            return false;
+        }
+
+        const auto header = request->getHeader(F("Host"));
+        if (!header) {
+            return false;
+        }
+
+        const auto host = header->value();
+
+        const auto domain = systemHostname() + '.';
+        const auto ip = wifiApIp().toString();
+
+        if (!host.equals(ip) && !host.startsWith(domain)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+// Allow only requests that use our hostname or IP
+bool _onAPModeRequest(AsyncWebServerRequest* request) {
+    if (wifiConnectable()) {
+        if (_isAPModeRequest(request)) {
+            return true;
+        }
+
+        // Immediately close the connection, ref: https://github.com/xoseperez/espurna/issues/1660
+        // Not doing so will cause memory exhaustion, because the connection will linger
+        request->send(404);
+        request->client()->close();
+
+        return false;
+    }
+
+    return true;
+}
+
 void _webRequestAuth(AsyncWebServerRequest* request) {
-    request->requestAuthentication(getSetting("hostname", getIdentifier()).c_str(), true);
+    request->requestAuthentication(systemHostname().c_str(), true);
 }
 
 void _onReset(AsyncWebServerRequest *request) {
-    webLog(request);
-    if (!webAuthenticate(request)) {
+    if (!_authenticateRequest(request)) {
         _webRequestAuth(request);
         return;
     }
 
-    deferredReset(100, CustomResetReason::Web);
+    prepareReset(CustomResetReason::Web);
     request->send(200);
 }
 
 void _onDiscover(AsyncWebServerRequest *request) {
+    StaticJsonBuffer<JSON_OBJECT_SIZE(5) + 128> buffer;
+    JsonObject& root = buffer.createObject();
 
-    webLog(request);
+    root["hostname"] = systemHostname();
+    root["device"] = systemDevice();
 
-    const String device = getBoardName();
-    const String hostname = getSetting("hostname");
+    const auto app = buildApp();
+    root["app"] = app.name;
+    root["version"] = app.version;
 
-    StaticJsonBuffer<JSON_OBJECT_SIZE(4)> jsonBuffer;
-    JsonObject &root = jsonBuffer.createObject();
-    root["app"] = getAppName();
-    root["version"] = getVersion();
-    root["device"] = device;
-    root["hostname"] = hostname.c_str();
-
-    AsyncResponseStream *response = request->beginResponseStream("application/json", root.measureLength() + 1);
+    auto* response = request->beginResponseStream(
+        F("application/json"), root.measureLength());
+    response->setCode(200);
     root.printTo(*response);
 
     request->send(response);
+}
 
+void _setupAccessControlHeaders() {
+    const auto domain = espurna::web::settings::domain();
+
+    auto& headers = DefaultHeaders::Instance();
+    _addHeader(headers, STRING_VIEW("Access-Control-Allow-Origin"), domain);
+    if (!domain.equals("*")) {
+        _addHeader(headers,
+            STRING_VIEW("Access-Control-Allow-Credentials"), STRING_VIEW("true"));
+    }
 }
 
 void _onGetConfig(AsyncWebServerRequest *request) {
-    if (!webAuthenticate(request)) {
+    if (!_authenticateRequest(request)) {
         _webRequestAuth(request);
         return;
     }
@@ -265,20 +439,21 @@ void _onGetConfig(AsyncWebServerRequest *request) {
     auto out = std::make_shared<String>();
     out->reserve(TCP_MSS);
 
+    const auto app = buildApp();
 
     char buffer[256];
     int prefix_len = snprintf_P(buffer, sizeof(buffer),
             PSTR("{\n\"app\": \"%s\",\n\"version\": \"%s\",\n\"backup\": \"1\""),
-            getAppName(), getVersion());
+            app.name.c_str(), app.version.c_str());
     if (prefix_len <= 0) {
         request->send(500);
         return;
     }
     out->concat(buffer, prefix_len);
 
-    settings::kv_store.foreach([&](settings::kvs_type::KeyValueResult&& kv) {
-        auto key = kv.key.read();
-        auto value = kv.value.read();
+    espurna::settings::foreach([&](espurna::settings::kvs_type::KeyValueResult&& kv) {
+        auto key = kv.key.toString();
+        auto value = kv.value.toString();
 
         int len = snprintf_P(buffer, sizeof(buffer), PSTR("\"%s\": \"%s\""), key.c_str(), value.c_str());
         if (len > 0) {
@@ -288,15 +463,8 @@ void _onGetConfig(AsyncWebServerRequest *request) {
     });
     *out += "\n}";
 
-    auto hostname = getSetting("hostname", getIdentifier());
-    auto timestamp = String(millis());
-#if NTP_SUPPORT
-    if (ntpSynced()) {
-        timestamp = ntpDateTime();
-    }
-#endif
-
-    AsyncWebServerResponse* response = request->beginChunkedResponse("application/json",
+    AsyncWebServerResponse* response = request->beginChunkedResponse(
+        F("application/json"),
         [out](uint8_t* buffer, size_t maxLen, size_t index) -> size_t {
             auto len = out->length();
             if (index == len) {
@@ -312,13 +480,24 @@ void _onGetConfig(AsyncWebServerRequest *request) {
             return have;
         });
 
+    auto get_timestamp = []() -> String {
+#if NTP_SUPPORT
+        if (ntpSynced()) {
+            return ntpDateTime();
+        }
+#endif
+        return String(espurna::time::millis().time_since_epoch().count(), 10);
+    };
+
     int written = snprintf_P(buffer, sizeof(buffer),
-        PSTR("attachment; filename=\"%s %s backup.json\""), hostname.c_str(), timestamp.c_str());
+        PSTR("attachment; filename=\"%s %s backup.json\""),
+        systemHostname().c_str(), get_timestamp().c_str());
+
     if (written > 0) {
-        response->addHeader("Content-Disposition", buffer);
-        response->addHeader("X-XSS-Protection", "1; mode=block");
-        response->addHeader("X-Content-Type-Options", "nosniff");
-        response->addHeader("X-Frame-Options", "deny");
+        _addSecurityHeaders(response);
+        _addHeader(*response,
+            STRING_VIEW("Content-Disposition"),
+            espurna::StringView(&buffer[0], written));
         request->send(response);
         return;
     }
@@ -327,112 +506,119 @@ void _onGetConfig(AsyncWebServerRequest *request) {
 }
 
 void _onPostConfig(AsyncWebServerRequest *request) {
-    webLog(request);
-    if (!webAuthenticate(request)) {
+    if (!_authenticateRequest(request)) {
         _webRequestAuth(request);
         return;
     }
-    request->send(_webConfigSuccess ? 200 : 400);
+    request->send(espurna::web::config_success ? 200 : 400);
 }
 
-void _onPostConfigFile(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+void _onPostConfigFile(AsyncWebServerRequest *request, String, size_t index, uint8_t *data, size_t len, bool final) {
 
-    if (!webAuthenticate(request)) {
+    if (!_authenticateRequest(request)) {
         _webRequestAuth(request);
         return;
     }
+
+    auto& success = espurna::web::config_success;
+    auto& buffer = espurna::web::config_buffer;
 
     // No buffer
     if (final && (index == 0)) {
-        _webConfigSuccess = settingsRestoreJson((char*) data);
+        success = settingsRestoreJson((char*) data);
         return;
     }
 
     // Buffer start => reset
-    if (index == 0) if (_webConfigBuffer) delete _webConfigBuffer;
+    if (index == 0) if (buffer) buffer.reset(nullptr);
 
     // init buffer if it doesn't exist
-    if (!_webConfigBuffer) {
-        _webConfigBuffer = new std::vector<uint8_t>();
-        _webConfigSuccess = false;
+    if (!buffer) {
+        buffer = std::make_unique<std::vector<uint8_t>>();
+        success = false;
     }
 
     // Copy
     if (len > 0) {
-        if ((_webConfigBuffer->size() + len) > std::min(WebConfigBufferMax, systemFreeHeap() - sizeof(std::vector<uint8_t>))) {
-            delete _webConfigBuffer;
-            _webConfigBuffer = nullptr;
+        using buffer_type = std::remove_cvref<decltype(buffer)>::type::element_type;
+        if ((buffer->size() + len) > std::min(WebConfigBufferMax, systemFreeHeap() - sizeof(buffer_type))) {
+            buffer.reset(nullptr);
             request->send(500);
             return;
         }
-        _webConfigBuffer->reserve(_webConfigBuffer->size() + len);
-        _webConfigBuffer->insert(_webConfigBuffer->end(), data, data + len);
+        buffer->reserve(buffer->size() + len);
+        buffer->insert(buffer->end(), data, data + len);
     }
 
     // Ending
     if (final) {
-
-        _webConfigBuffer->push_back(0);
-        _webConfigSuccess = settingsRestoreJson((char*) _webConfigBuffer->data());
-        delete _webConfigBuffer;
-
+        buffer->push_back(0);
+        success = settingsRestoreJson((char*) buffer->data());
+        buffer.reset(nullptr);
     }
 
 }
 
-#if WEB_EMBEDDED
-void _onHome(AsyncWebServerRequest *request) {
+#if WIFI_AP_CAPTIVE_SUPPORT
+String _apCaptiveLocation() {
+    STRING_VIEW_INLINE(Prefix, "http://");
+    return Prefix.toString() + wifiApIp().toString();
+}
 
-    webLog(request);
-    if (!webAuthenticate(request)) {
+void _onAPCaptiveRequest(AsyncWebServerRequest* request) {
+    if (wifiConnectable()) {
+        auto* response = request->beginResponse(302);
+
+        _addHeader(*response,
+            STRING_VIEW("Location"), _apCaptiveLocation());
+        _addConnectionClose(response);
+
+        request->send(response);
+        return;
+    }
+
+    request->send(404);
+}
+#endif
+
+#if WEB_EMBEDDED
+
+void _onHome(AsyncWebServerRequest *request) {
+    if (!_isAPModeRequest(request) && !_authenticateRequest(request)) {
         _webRequestAuth(request);
         return;
     }
 
-    if (request->header("If-Modified-Since").equals(_last_modified)) {
-
+    const auto* modified = request->getHeader(
+        STRING_VIEW("If-Modified-Since").toString());
+    if (modified && (modified->value() == WebLastModified)) {
         request->send(304);
-
-    } else {
-
-        #if WEB_SSL_ENABLED
-
-            // Chunked response, we calculate the chunks based on free heap (in multiples of 32)
-            // This is necessary when a TLS connection is open since it sucks too much memory
-            DEBUG_MSG_P(PSTR("[MAIN] Free heap: %d bytes\n"), systemFreeHeap());
-            size_t max = (systemFreeHeap() / 3) & 0xFFE0;
-
-            AsyncWebServerResponse *response = request->beginChunkedResponse("text/html", [max](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
-
-                // Get the chunk based on the index and maxLen
-                size_t len = webui_image_len - index;
-                if (len > maxLen) len = maxLen;
-                if (len > max) len = max;
-                if (len > 0) memcpy_P(buffer, webui_image + index, len);
-
-                DEBUG_MSG_P(PSTR("[WEB] Sending %d%%%% (max chunk size: %4d)\r"), int(100 * index / webui_image_len), max);
-                if (len == 0) DEBUG_MSG_P(PSTR("\n"));
-
-                // Return the actual length of the chunk (0 for end of file)
-                return len;
-
-            });
-
-        #else
-
-            AsyncWebServerResponse *response = request->beginResponse_P(200, "text/html", webui_image, webui_image_len);
-
-        #endif
-
-        response->addHeader("Content-Encoding", "gzip");
-        response->addHeader("Last-Modified", _last_modified);
-        response->addHeader("X-XSS-Protection", "1; mode=block");
-        response->addHeader("X-Content-Type-Options", "nosniff");
-        response->addHeader("X-Frame-Options", "deny");
-        request->send(response);
-
+        return;
     }
 
+#if WEB_SSL_ENABLED
+    // Chunked response, we calculate the chunks based on free heap (in multiples of 32)
+    // This is necessary when a TLS connection is open since it sucks too much memory
+    const size_t max = (systemFreeHeap() / 3) & 0xFFE0;
+    auto* response = request->beginChunkedResponse("text/html", [max](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+        // Get the chunk based on the index and maxLen
+        size_t len = std::size(webui_data) - index;
+        len = std::min({len, maxLen, max});
+        if (len > 0) {
+            memcpy_P(buffer, webui_data + index, len);
+        }
+
+        // Return the actual length of the chunk (0 for end of file)
+        return len;
+    });
+#else
+    auto* response = request->beginResponse_P(200, F("text/html"), webui_data, std::size(webui_data));
+#endif
+
+    _addGenericHeaders(response);
+    _addSecurityHeaders(response);
+
+    request->send(response);
 }
 #endif
 
@@ -487,35 +673,12 @@ int _onCertificate(void * arg, const char *filename, uint8_t **buf) {
 
 #endif // WEB_SSL_ENABLED
 
-bool _onAPModeRequest(AsyncWebServerRequest *request) {
-
-    if ((WiFi.getMode() & WIFI_AP) > 0) {
-        const String domain = getSetting("hostname") + ".";
-        const String host = request->header("Host");
-        const String ip = WiFi.softAPIP().toString();
-
-        // Only allow requests that use our hostname or ip
-        if (host.equals(ip)) return true;
-        if (host.startsWith(domain)) return true;
-
-        // Immediatly close the connection, ref: https://github.com/xoseperez/espurna/issues/1660
-        // Not doing so will cause memory exhaustion, because the connection will linger
-        request->send(404);
-        request->client()->close();
-
-        return false;
-    }
-
-    return true;
-
-}
-
 void _onRequest(AsyncWebServerRequest *request){
 
     if (!_onAPModeRequest(request)) return;
 
     // Send request to subscribers, break when request is 'handled' by the callback
-    for (auto& callback : _web_request_callbacks) {
+    for (auto& callback : espurna::web::request_callbacks) {
         if (callback(request)) {
             return;
         }
@@ -524,7 +687,7 @@ void _onRequest(AsyncWebServerRequest *request){
     // No subscriber handled the request, return a 404 with implicit "Connection: close"
     request->send(404);
 
-    // And immediatly close the connection, ref: https://github.com/xoseperez/espurna/issues/1660
+    // And immediately close the connection, ref: https://github.com/xoseperez/espurna/issues/1660
     // Not doing so will cause memory exhaustion, because the connection will linger
     request->client()->close();
 
@@ -535,8 +698,8 @@ void _onBody(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t i
     if (!_onAPModeRequest(request)) return;
 
     // Send request to subscribers
-    for (unsigned char i = 0; i < _web_body_callbacks.size(); i++) {
-        bool response = (_web_body_callbacks[i])(request, data, len, index, total);
+    for (unsigned char i = 0; i < espurna::web::body_callbacks.size(); i++) {
+        bool response = (espurna::web::body_callbacks[i])(request, data, len, index, total);
         if (response) return;
     }
 
@@ -546,42 +709,54 @@ void _onBody(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t i
 
 }
 
+void _onVisible(JsonObject& root) {
+    root[espurna::web::settings::keys::Port] = espurna::web::port;
+}
 
-// -----------------------------------------------------------------------------
+bool _onKeyCheck(espurna::StringView key, const JsonVariant&) {
+    return key.startsWith(espurna::web::settings::keys::Prefix);
+}
+
+} // namespace
+
+void webSecurityHeaders(AsyncWebServerResponse* response) {
+    _addSecurityHeaders(response);
+}
+
+bool webApModeRequest(AsyncWebServerRequest* request) {
+    return _isAPModeRequest(request);
+}
 
 bool webAuthenticate(AsyncWebServerRequest *request) {
-    #if USE_PASSWORD
-        return request->authenticate(WEB_USERNAME, getAdminPass().c_str());
-    #else
-        return true;
-    #endif
-}
-
-// -----------------------------------------------------------------------------
-
-AsyncWebServer& webServer() {
-    return *_server;
-}
-
-void webBodyRegister(web_body_callback_f callback) {
-    _web_body_callbacks.push_back(callback);
-}
-
-void webRequestRegister(web_request_callback_f callback) {
-    _web_request_callbacks.push_back(callback);
+    return _authenticateRequest(request);
 }
 
 uint16_t webPort() {
-    #if WEB_SSL_ENABLED
-        return 443;
-    #else
-        constexpr const uint16_t defaultValue(WEB_PORT);
-        return getSetting("webPort", defaultValue);
-    #endif
+    return espurna::web::port;
 }
 
-void webLog(AsyncWebServerRequest *request) {
-    DEBUG_MSG_P(PSTR("[WEBSERVER] %s %s\n"), request->methodToString(), request->url().c_str());
+AsyncWebServer& webServer() {
+    return *espurna::web::server;
+}
+
+void webBodyRegister(web_body_callback_f callback) {
+    espurna::web::body_callbacks.push_back(callback);
+}
+
+void webRequestRegister(web_request_callback_f callback) {
+    espurna::web::request_callbacks.push_back(callback);
+}
+
+void webLog(AsyncWebServerRequest* request) {
+    const auto client = request->client();
+    String from = client
+        ? client->remoteIP().toString()
+        : F("(unknown)");
+
+    DEBUG_MSG_P(PSTR("[WEBSERVER] %s - %s %s\n"),
+        from.c_str(),
+        request->methodToString(),
+        request->url().c_str());
 }
 
 class WebAccessLogHandler : public AsyncWebHandler {
@@ -592,59 +767,69 @@ class WebAccessLogHandler : public AsyncWebHandler {
 };
 
 void webSetup() {
-
-    // Cache the Last-Modifier header value
-    snprintf_P(_last_modified, sizeof(_last_modified), PSTR("%s %s GMT"), __DATE__, __TIME__);
-
     // Create server and install global URL debug handler
     // (since we don't want to forcibly add it to each instance)
-    unsigned int port = webPort();
-    _server = new AsyncWebServer(port);
+    using namespace espurna::web;
+
+    port = settings::port();
+    server = new AsyncWebServer(port);
 
 #if DEBUG_SUPPORT
-    if (getSetting("webAccessLog", (1 == WEB_ACCESS_LOG))) {
+    if (settings::access_log()) {
         static WebAccessLogHandler log;
-        _server->addHandler(&log);
+        server->addHandler(&log);
     }
 #endif
 
     // Rewrites
-    _server->rewrite("/", "/index.html");
+    server->rewrite("/", "/index.html");
 
     // Serve home (basic authentication protection is done manually b/c the handler is installed through callback functions)
     #if WEB_EMBEDDED
-        _server->on("/index.html", HTTP_GET, _onHome);
+        server->on("/index.html", HTTP_GET, _onHome);
     #endif
 
     // Serve static files (not supported, yet)
     #if SPIFFS_SUPPORT
-        _server->serveStatic("/", SPIFFS, "/")
-            .setLastModified(_last_modified)
+        server->serveStatic("/", SPIFFS, "/")
+            .setLastModified(WebLastModified.toString().c_str())
             .setFilter([](AsyncWebServerRequest *request) -> bool {
                 webLog(request);
                 return true;
             });
     #endif
 
-    _server->on("/reset", HTTP_GET, _onReset);
-    _server->on("/config", HTTP_GET, _onGetConfig);
-    _server->on("/config", HTTP_POST | HTTP_PUT, _onPostConfig, _onPostConfigFile);
-    _server->on("/discover", HTTP_GET, _onDiscover);
+    server->on("/reset", HTTP_GET, _onReset);
+    server->on("/config", HTTP_GET, _onGetConfig);
+    server->on("/config", HTTP_POST | HTTP_PUT, _onPostConfig, _onPostConfigFile);
+    server->on("/discover", HTTP_GET, _onDiscover);
+
+#if WIFI_AP_CAPTIVE_SUPPORT
+    server->on("/generate_204", _onAPCaptiveRequest);
+    server->on("/fwlink", _onAPCaptiveRequest);
+#endif
 
     // Handle every other request, including 404
-    _server->onRequestBody(_onBody);
-    _server->onNotFound(_onRequest);
+    server->onRequestBody(_onBody);
+    server->onNotFound(_onRequest);
 
     // Run server
     #if WEB_SSL_ENABLED
-        _server->onSslFileRequest(_onCertificate, NULL);
-        _server->beginSecure("server.cer", "server.key", NULL);
+        server->onSslFileRequest(_onCertificate, NULL);
+        server->beginSecure("server.cer", "server.key", NULL);
     #else
-        _server->begin();
+        server->begin();
     #endif
 
-    DEBUG_MSG_P(PSTR("[WEBSERVER] Webserver running on port %u\n"), port);
+    DEBUG_MSG_P(PSTR("[WEBSERVER] Webserver running on port %hu\n"), port);
 
+    // CORS setup
+    _setupAccessControlHeaders();
+
+    // Handle ws server settings updates
+    wsRegister()
+        .onVisible(_onVisible)
+        .onKeyCheck(_onKeyCheck);
 }
 
 #endif // WEB_SUPPORT

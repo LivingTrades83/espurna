@@ -11,220 +11,881 @@ Copyright (C) 2020 by Maxim Prokhorov <prokhorov dot max at outlook dot com>
 #include <cctype>
 
 #include "terminal_parsing.h"
+#include "libs/Delimiter.h"
 
+namespace espurna {
 namespace terminal {
-namespace parsing {
+namespace parser {
 
+String error(Error value) {
+    StringView out;
 
-// c/p with minor modifications from redis / sds, so that we don't have to roll a custom parser
-// ref:
-// - https://github.com/antirez/sds/blob/master/sds.c
-// - https://github.com/antirez/redis/blob/unstable/src/networking.c
-//
-// Things are kept mostly the same, we are replacing Redis-specific things:
-// - sds structure -> String
-// - sds array -> std::vector<String>
-// - we return always return custom structure, nullptr can no longer be used
-//   to notify about the missing / unterminated / mismatching quotes
-// - hex_... function helpers types are changed
+    switch (value) {
+    case Error::Uninitialized:
+        out = STRING_VIEW("Uninitialized");
+        break;
+    case Error::Busy:
+        out = STRING_VIEW("Busy");
+        break;
+    case Error::InvalidEscape:
+        out = STRING_VIEW("InvalidEscape");
+        break;
+    case Error::NoSpaceAfterQuote:
+        out = STRING_VIEW("NoSpaceAfterQuote");
+        break;
+    case Error::UnexpectedLineEnd:
+        out = STRING_VIEW("UnexpectedLineEnd");
+        break;
+    case Error::UnterminatedQuote:
+        out = STRING_VIEW("UnterminatedQuote");
+        break;
+    case Error::Ok:
+        out = STRING_VIEW("Ok");
+        break;
+    }
+
+    return out.toString();
+}
+
+namespace {
 
 // Original code is part of the SDSLib 2.0 -- A C dynamic strings library
-//  *
-//  * Copyright (c) 2006-2015, Salvatore Sanfilippo <antirez at gmail dot com>
-//  * Copyright (c) 2015, Oran Agra
-//  * Copyright (c) 2015, Redis Labs, Inc
-//  * All rights reserved.
-//  *
-//  * Redistribution and use in source and binary forms, with or without
-//  * modification, are permitted provided that the following conditions are met:
-//  *
-//  *   * Redistributions of source code must retain the above copyright notice,
-//  *     this list of conditions and the following disclaimer.
-//  *   * Redistributions in binary form must reproduce the above copyright
-//  *     notice, this list of conditions and the following disclaimer in the
-//  *     documentation and/or other materials provided with the distribution.
-//  *   * Neither the name of Redis nor the names of its contributors may be used
-//  *     to endorse or promote products derived from this software without
-//  *     specific prior written permission.
-//  *
-//  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-//  * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-//  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-//  * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
-//  * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-//  * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-//  * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-//  * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-//  * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-//  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-//  * POSSIBILITY OF SUCH DAMAGE.
+// - https://github.com/antirez/sds/blob/master/sds.c
+// - https://github.com/antirez/redis/blob/unstable/src/networking.c
+// Replaced with a stateful parser to avoid random look-ahead issues in the code,
+// and really make sure we **never** go out of bounds of the given view.
+// (e.g. when we want to parse only a part of a larger string)
 
-// Helper functions to handle \xHH codes
-static bool is_hex_digit(char c) {
-    return (c >= '0' && c <= '9') \
-         ||(c >= 'a' && c <= 'f') \
-         ||(c >= 'A' && c <= 'F');
-}
-
-static char hex_digit_to_int(char c) {
+// Helper functions to handle \xHH codes that could encode
+// non-printable characters for commands or arguments
+bool is_hex_digit(char c) {
     switch (c) {
-        case '0': return 0;
-        case '1': return 1;
-        case '2': return 2;
-        case '3': return 3;
-        case '4': return 4;
-        case '5': return 5;
-        case '6': return 6;
-        case '7': return 7;
-        case '8': return 8;
-        case '9': return 9;
-        case 'a': case 'A': return 10;
-        case 'b': case 'B': return 11;
-        case 'c': case 'C': return 12;
-        case 'd': case 'D': return 13;
-        case 'e': case 'E': return 14;
-        case 'f': case 'F': return 15;
-        default: return 0;
+    case '0' ... '9':
+    case 'a' ... 'f':
+    case 'A' ... 'F':
+        return true;
     }
+
+    return false;
 }
 
-// Our port of `sdssplitargs`
-CommandLine parse_commandline(const char *line) {
-    const char *p = line;
+char hex_digit_to_byte(char c) {
+    switch (c) {
+    case '0'...'9':
+        return c - '0';
+    case 'a':
+    case 'A':
+        return 10;
+    case 'b':
+    case 'B':
+        return 11;
+    case 'c':
+    case 'C':
+        return 12;
+    case 'd':
+    case 'D':
+        return 13;
+    case 'e':
+    case 'E':
+        return 14;
+    case 'f':
+    case 'F':
+        return 15;
+    }
 
-    Argv argv;
-    argv.reserve(4);
+    return 0;
+}
 
-    String current;
+char hex_digit_to_value(char lhs, char rhs) {
+    return (hex_digit_to_byte(lhs) << 4) | hex_digit_to_byte(rhs);
+}
 
-    while(1) {
-        /* skip blanks */
-        while(*p && isspace(*p)) p++;
-        if (*p) {
-            /* get a token */
-            int inq=0;  /* set to 1 if we are in "quotes" */
-            int insq=0; /* set to 1 if we are in 'single quotes' */
-            int done=0;
+// allowed 'special' input characters
+char unescape_char(char c) {
+    switch (c) {
+    case 'n':
+        return '\n';
+    case 'r':
+        return '\r';
+    case 't':
+        return '\t';
+    case 'b':
+        return '\b';
+    case 'a':
+        return '\a';
+    }
 
-            while(!done) {
-                if (inq) {
-                    if (*p == '\\' && *(p+1) == 'x' &&
-                                             is_hex_digit(*(p+2)) &&
-                                             is_hex_digit(*(p+3)))
-                    {
-                        // XXX: make sure that we append `char` or `char[]`,
-                        // even with -funsigned-char this can accidentally append itoa conversion
-                        unsigned char byte = 
-                            (hex_digit_to_int(*(p+2))*16)+
-                            hex_digit_to_int(*(p+3));
-                        char buf[2] { static_cast<char>(byte), 0x00 };
-                        current += buf;
-                        p += 3;
-                    } else if (*p == '\\' && *(p+1)) {
-                        char c;
+    return c;
+}
 
-                        p++;
-                        switch(*p) {
-                        case 'n': c = '\n'; break;
-                        case 'r': c = '\r'; break;
-                        case 't': c = '\t'; break;
-                        case 'b': c = '\b'; break;
-                        case 'a': c = '\a'; break;
-                        default: c = *p; break;
-                        }
-                        current += c;
-                    } else if (*p == '"') {
-                        /* closing quote must be followed by a space or
-                         * nothing at all. */
-                        if (*(p+1) && !isspace(*(p+1))) goto err;
-                        done=1;
-                    } else if (!*p) {
-                        /* unterminated quotes */
-                        goto err;
-                    } else {
-                        char buf[2] {*p, '\0'};
-                        current += buf;
-                    }
-                } else if (insq) {
-                    if (*p == '\\' && *(p+1) == '\'') {
-                        p++;
-                        current += '\'';
-                    } else if (*p == '\'') {
-                        /* closing quote must be followed by a space or
-                         * nothing at all. */
-                        if (*(p+1) && !isspace(*(p+1))) goto err;
-                        done=1;
-                    } else if (!*p) {
-                        /* unterminated quotes */
-                        goto err;
-                    } else {
-                        char buf[2] {*p, '\0'};
-                        current += buf;
-                    }
-                } else {
-                    switch(*p) {
-                    case ' ':
-                    case '\n':
-                    case '\r':
-                    case '\t':
-                    case '\0':
-                        done=1;
-                        break;
-                    case '"':
-                        inq=1;
-                        break;
-                    case '\'':
-                        insq=1;
-                        break;
-                    default: {
-                        char buf[2] {*p, '\0'};
-                        current += buf;
-                        break;
-                    }
-                    }
-                }
-                if (*p) p++;
-            }
-            /* add the token to the vector */
-            argv.emplace_back(std::move(current));
-        } else {
-            /* Even on empty input string return something not NULL. */
-            goto out;
+// Intermediate storage for parsed tokens and (optionally) buffered values from escaped characters
+struct Values {
+    // contiguous view to the original input
+    // passed as sv to 'tokens' when data can be used as-is
+    const char* span_begin { nullptr };
+    size_t span_len { 0 };
+
+    // temporary for 'buffer' when escaped data appears and part of the string is copied here
+    String token;
+    char byte_lhs { 0 };
+
+    Tokens tokens;
+    Buffer buffer;
+
+    bool token_available() const {
+        return token.length() != 0;
+    }
+
+    StringView make_span_view() const {
+        return StringView(span_begin, span_len);
+    }
+
+    bool span_available() const {
+        return span_begin && span_len;
+    }
+
+    void reset_span(const char* it) {
+        span_begin = it;
+        span_len = 0;
+    }
+
+    void append_span(const char* it) {
+        if (!span_available()) {
+            reset_span(it);
+        }
+
+        ++span_len;
+    }
+
+    void push_span() {
+        if (span_available()) {
+            token += make_span_view();
+            reset_span(nullptr);
         }
     }
 
-err:
-    argv.clear();
-out:
-    size_t argc = argv.size();
-    return CommandLine{std::move(argv), argc};
-}
+    bool push_span_token() {
+        if (span_available()) {
+            tokens.push_back(make_span_view());
+            reset_span(nullptr);
+            return true;
+        }
 
-// Fowler–Noll–Vo hash function to hash command strings that treats input as lowercase
-// ref: https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
-//
-// This is here in case `std::unordered_map` becomes viable
-// TODO: afaik, map implementation should handle collisions (however rare they are in our case)
-// if not, we can always roll static commands allocation and just match strings with strcmp_P
-
-uint32_t lowercase_fnv1_hash(const char* ptr) {
-    constexpr uint32_t fnv_prime = 16777619u;
-    constexpr uint32_t fnv_basis = 2166136261u;
-
-    const auto length = strlen_P(ptr);
-
-    uint32_t hash = fnv_basis;
-    for (size_t idx = 0; idx < length; ++idx) {
-        hash = hash ^ static_cast<uint32_t>(tolower(pgm_read_byte(&ptr[idx])));
-        hash = hash * fnv_prime;
+        return false;
     }
 
-    return hash;
+    bool push_buffered_token() {
+        if (token_available()) {
+            push_span();
+            buffer.push_back(std::move(token));
+            tokens.push_back(buffer.back());
+            return true;
+        }
+
+        return false;
+    }
+
+    void append_token(char c) {
+        push_span();
+        token.concat(&c, 1);
+    }
+
+    void append_byte_lhs(char c) {
+        byte_lhs = c;
+    }
+
+    void append_byte_rhs(char c) {
+        append_token(hex_digit_to_value(byte_lhs, c));
+    }
+
+    void push_token() {
+        if (!push_buffered_token() && !push_span_token()) {
+            tokens.push_back(StringView{});
+        }
+    }
+};
+
+struct Result {
+    Result() = default;
+
+    Result& operator=(Error error) noexcept {
+        _error = error;
+        _buffer.clear();
+        _tokens.clear();
+        return *this;
+    }
+
+    Result& operator=(Values&& values) noexcept {
+        _buffer = std::move(values.buffer);
+        _tokens = std::move(values.tokens);
+        _error = Error::Ok;
+        return *this;
+    }
+
+    Result& operator=(StringView value) noexcept {
+        _remaining = value;
+        return *this;
+    }
+
+    explicit operator bool() const {
+        return _error == Error::Ok;
+    }
+
+    Error error() const {
+        return _error;
+    }
+
+    ParsedLine get() {
+        auto error = _error;
+        _error = Error::Uninitialized;
+
+        auto remaining = _remaining;
+        _remaining = StringView{};
+
+        return ParsedLine{
+            .tokens = std::move(_tokens),
+            .buffer = std::move(_buffer),
+            .remaining = std::move(remaining),
+            .error = error,
+        };
+    }
+
+private:
+    Error _error { Error::Uninitialized };
+    StringView _remaining;
+    Tokens _tokens;
+    Buffer _buffer;
+};
+
+constexpr auto Lf = StringView("\n");
+
+struct Parser {
+    Parser() = default;
+    Result operator()(StringView view, bool inject_newline = false);
+
+private:
+    // only tracked within our `operator()(<LINE>)`
+    enum class State {
+        Done,
+        Initial,
+        Text,
+        CarriageReturn,
+        CarriageReturnAfterText,
+        SkipUntilNewLine,
+        EscapedText,
+        EscapedByteLhs,
+        EscapedByteRhs,
+        SingleQuote,
+        EscapedQuote,
+        DoubleQuote,
+        AfterQuote,
+    };
+
+    bool _parsing { false };
+};
+
+Result Parser::operator()(StringView line, bool inject_newline) {
+    Result result;
+    Values values;
+
+    auto it = line.begin();
+    auto end = line.end();
+
+    auto state = State::Initial;
+
+    ReentryLock lock(_parsing);
+    if (!lock.initialized()) {
+        result = Error::Busy;
+        goto out;
+    }
+
+loop:
+    for (;it != end; ++it) {
+        switch (state) {
+        case State::Initial:
+            switch (*it) {
+            case ' ':
+            case '\t':
+                break;
+            case '\r':
+                state = State::CarriageReturn;
+                break;
+            case ';':
+            case '\n':
+                state = State::Done;
+                break;
+            default:
+                state = State::Text;
+                goto text;
+            }
+            break;
+
+        case State::Done:
+            goto out;
+
+        case State::Text:
+text:
+            switch (*it) {
+            case ' ':
+            case '\t':
+                values.push_token();
+                state = State::Initial;
+                break;
+            case '"':
+                state = State::DoubleQuote;
+                break;
+            case '\'':
+                state = State::SingleQuote;
+                break;
+            case '\r':
+                state = State::CarriageReturnAfterText;
+                break;
+            case ';':
+            case '\n':
+                values.push_token();
+                state = State::Done;
+                break;
+            default:
+                values.append_span(it);
+                break;
+            }
+            break;
+
+        case State::CarriageReturn:
+            if ((*it) == '\n') {
+                state = State::Done;
+            } else {
+                result = Error::UnexpectedLineEnd;
+                goto out;
+            }
+            break;
+
+        case State::CarriageReturnAfterText:
+            if ((*it) == '\n') {
+                values.push_token();
+                state = State::Done;
+            } else {
+                result = Error::UnexpectedLineEnd;
+                goto out;
+            }
+            break;
+
+        case State::SkipUntilNewLine:
+            switch (*it) {
+            case '\r':
+                state = State::CarriageReturn;
+                break;
+            case ';':
+            case '\n':
+                state = State::Initial;
+                break;
+            }
+            break;
+
+        case State::EscapedText: {
+            switch (*it) {
+            case ';':
+            case '\r':
+            case '\n':
+                result = Error::UnexpectedLineEnd;
+                goto out;
+            case 'x':
+                state = State::EscapedByteLhs;
+                break;
+            default:
+                values.append_token(unescape_char(*it));
+                break;
+            }
+            break;
+        }
+
+        case State::EscapedByteLhs:
+            if (is_hex_digit(*it)) {
+                values.append_byte_lhs(*it);
+                state = State::EscapedByteRhs;
+            } else {
+                result = Error::InvalidEscape;
+                goto out;
+            }
+            break;
+
+        case State::EscapedByteRhs:
+            if (is_hex_digit(*it)) {
+                values.append_byte_rhs(*it);
+                state = State::DoubleQuote;
+            } else {
+                result = Error::InvalidEscape;
+                goto out;
+            }
+            break;
+
+        case State::SingleQuote:
+            switch (*it) {
+            case ';':
+            case '\n':
+            case '\r':
+                result = Error::UnterminatedQuote;
+                goto out;
+            case '\\':
+                state = State::EscapedQuote;
+                break;
+            case '\'':
+                state = State::AfterQuote;
+                break;
+            default:
+                values.append_span(it);
+                break;
+            }
+            break;
+
+        case State::EscapedQuote:
+            switch (*it) {
+            case '\'':
+                values.append_token(*it);
+                state = State::SingleQuote;
+                break;
+            default:
+                result = Error::InvalidEscape;
+                goto out;
+            }
+            break;
+
+        case State::AfterQuote:
+            switch (*it) {
+            case '\r':
+                state = State::CarriageReturnAfterText;
+                break;
+            case ' ':
+            case '\t':
+                values.push_token();
+                state = State::Initial;
+                break;
+            case ';':
+            case '\n':
+                values.push_token();
+                state = State::Done;
+                break;
+            default:
+                result = Error::NoSpaceAfterQuote;
+                goto out;
+            }
+            break;
+
+        case State::DoubleQuote:
+            switch (*it) {
+            case ';':
+            case '\n':
+            case '\r':
+                result = Error::UnterminatedQuote;
+                goto out;
+            case '"':
+                state = State::AfterQuote;
+                break;
+            case '\\':
+                state = State::EscapedText;
+                break;
+            default:
+                values.append_span(it);
+                break;
+            }
+            break;
+
+        }
+    }
+
+out:
+    switch (state) {
+    case State::CarriageReturn:
+    case State::CarriageReturnAfterText:
+    case State::Text:
+    case State::Initial:
+    case State::SkipUntilNewLine:
+    case State::AfterQuote:
+        if (inject_newline) {
+            inject_newline = false;
+            it = Lf.begin();
+            end = Lf.end();
+            goto loop;
+        }
+        break;
+
+    default:
+        break;
+    }
+
+    if ((it >= line.begin()) && (it <= line.end())) {
+        result = StringView(it, end);
+    }
+
+    if (state == State::Done) {
+        result = std::move(values);
+    }
+
+    // whenever line ends before we are done parsing, make sure
+    // result contains a valid error condition (same as in the switch above)
+    if (result.error() == Error::Uninitialized) {
+        switch (state) {
+        case State::Done:
+            break;
+        case State::CarriageReturn:
+        case State::CarriageReturnAfterText:
+        case State::Text:
+        case State::Initial:
+        case State::SkipUntilNewLine:
+            result = Error::UnexpectedLineEnd;
+            break;
+        case State::EscapedByteLhs:
+        case State::EscapedByteRhs:
+        case State::EscapedText:
+        case State::EscapedQuote:
+            result = Error::InvalidEscape;
+            break;
+        case State::SingleQuote:
+        case State::DoubleQuote:
+            result = Error::UnterminatedQuote;
+            break;
+        case State::AfterQuote:
+            result = Error::NoSpaceAfterQuote;
+            break;
+        }
+    }
+
+    return result;
 }
 
-uint32_t lowercase_fnv1_hash(const __FlashStringHelper* ptr) {
-    return lowercase_fnv1_hash(reinterpret_cast<const char*>(ptr));
+Parser parser_instance;
+
+ParsedLine parse_line(StringView line, bool inject_newline) {
+    return parser_instance(line, inject_newline).get();
 }
 
-} // namespace parsing
+} // namespace
+} // namespace parser
+
+ParsedLine parse_line(StringView value) {
+    return parser::parse_line(value, false);
+}
+
+ParsedLine parse_terminated(StringView value) {
+    return parser::parse_line(value, true);
+}
+
 } // namespace terminal
+
+namespace {
+
+// rough implementation for an arbitrary string<->string 'first match' of rhs within lhs
+const char* find_first(StringView lhs, StringView rhs) {
+    auto begin = lhs.begin();
+    auto end = lhs.end();
+
+    auto rhs_begin = rhs.begin();
+    auto rhs_end = rhs.end();
+
+    for (;;) {
+        auto it = begin;
+
+        for (auto rhs_it = rhs_begin;; ++it, ++rhs_it) {
+            if (rhs_it == rhs_end) {
+                return begin;
+            }
+
+            if (it == end) {
+                return end;
+            }
+
+            if (*rhs_it != *it) {
+                break;
+            }
+        }
+
+        ++begin;
+    }
+
+    return end;
+}
+
+} // namespace
+
+StringView without_trailing(StringView value, char c) {
+    if (value.length()) {
+        const auto last = value.length() - 1;
+        if (value[last] == c) {
+            return value.slice(0, last);
+        }
+    }
+
+    return value;
+}
+
+LineView::LineView(StringView value) :
+    DelimiterView(value, terminal::parser::Lf)
+{}
+
+StringView LineView::next() {
+    return without_trailing(DelimiterView::next(), '\r');
+}
+
+namespace line_buffer_impl {
+
+Base::Result Base::next() {
+    auto next = DelimiterBuffer::next();
+    return Result{
+        .value = without_trailing(next.value, '\r'),
+        .overflow = next.overflow,
+    };
+}
+
+Base::Base(char *data, size_t size) :
+    DelimiterBuffer(data, size, terminal::parser::Lf)
+{}
+
+} // namespace line_buffer_impl
+
+DelimiterBuffer::DelimiterBuffer(char* storage, size_t capacity, StringView delimiter) :
+    _storage(storage),
+    _capacity(capacity),
+    _delimiter(delimiter)
+{}
+
+DelimiterBuffer::DelimiterBuffer(char* storage, size_t capacity) :
+    DelimiterBuffer(storage, capacity, terminal::parser::Lf)
+{}
+
+DelimiterBuffer::Result DelimiterBuffer::next() {
+    const auto current = get();
+
+    if (current.length()) {
+        if (!_delimiter.length()) {
+            auto overflow = _overflow;
+            reset();
+
+            return Result{
+                .value = current,
+                .overflow = overflow,
+            };
+        }
+
+        auto first = find_first(current, _delimiter);
+        if (first != current.end()) {
+            const auto value = StringView{current.begin(), first};
+            const auto out = Result{
+                .value = value,
+                .overflow = _overflow
+            };
+
+            const auto after = value.length() + _delimiter.length();
+            const auto cursor = _cursor + after;
+            if (cursor != _size) {
+                _cursor = cursor;
+            } else {
+                reset();
+            }
+
+            return out;
+        }
+    }
+
+    return Result{
+        .value = StringView(),
+        .overflow = _overflow
+    };
+}
+
+void DelimiterBuffer::append(const char* data, size_t length) {
+    // adjust pointer and length when they immediatelly cause overflow
+    auto output = &_storage[_size];
+
+    auto capacity = _capacity - _size;
+    while (length > capacity) {
+        data += capacity;
+        length -= capacity;
+        capacity = _capacity;
+        output = &_storage[0];
+        _size = 0;
+        _overflow = true;
+    }
+
+    if (length) {
+        std::memcpy(output, data, length);
+        _size += length;
+    }
+}
+
+void DelimiterBuffer::append(Stream& stream, size_t length) {
+    auto output = &_storage[_size];
+    auto capacity = _capacity - _size;
+
+#if defined(ARDUINO_ESP8266_RELEASE_2_7_2) \
+|| defined(ARDUINO_ESP8266_RELEASE_2_7_3) \
+|| defined(ARDUINO_ESP8266_RELEASE_2_7_4)
+#else
+    const auto peek = stream.hasPeekBufferAPI();
+#endif
+
+    while (length > capacity) {
+        const auto chunk = std::min(_capacity - _size, length);
+
+#if defined(ARDUINO_ESP8266_RELEASE_2_7_2) \
+|| defined(ARDUINO_ESP8266_RELEASE_2_7_3) \
+|| defined(ARDUINO_ESP8266_RELEASE_2_7_4)
+        stream.readBytes(output, chunk);
+#else
+        if (peek) {
+            stream.peekConsume(chunk);
+        } else {
+            stream.readBytes(output, chunk);
+        }
+#endif
+
+        length -= capacity;
+        capacity = _capacity;
+        output = &_storage[0];
+
+        _size = 0;
+        _overflow = true;
+    }
+
+    if (length) {
+        stream.readBytes(output, length);
+        _size += length;
+    }
+}
+
+StringView DelimiterView::next() {
+    const auto current = get();
+
+    if (current.length()) {
+        if (!_delimiter.length()) {
+            _cursor = _view.length();
+            return current;
+        }
+
+        const auto first = find_first(current, _delimiter);
+        if (first != current.end()) {
+            const auto value = StringView{current.begin(), first};
+
+            _cursor += value.length();
+            _cursor += _delimiter.length();
+
+            return value;
+        }
+    }
+
+    return StringView();
+}
+
+constexpr auto Space = StringView(" ");
+
+SplitView::SplitView(StringView view) :
+    SplitView(view, Space)
+{}
+
+SplitView::SplitView(StringView view, StringView delimiter) :
+    _view(view),
+    _delimiter(delimiter)
+{}
+
+SplitView::SplitView::Iterator::Iterator(const SplitView* base) :
+    _base(base),
+    _value(_base->before_begin())
+{}
+
+SplitView::SplitView::Iterator::Iterator(const SplitView* base, End) :
+    _base(base),
+    _value(_base->at_end())
+{}
+
+SplitView::Iterator SplitView::begin() const {
+    Iterator it(this);
+    it.next();
+    return it;
+}
+
+SplitView::Iterator SplitView::end() const {
+    return Iterator(this, Iterator::End{});
+}
+
+StringView SplitView::Iterator::remaining() const {
+    return StringView(after_delimiter(_base->_view.end()).begin(), _base->_view.end());
+}
+
+StringView SplitView::Iterator::after_delimiter(const char* end) const {
+    if (_value.begin() < _base->_view.begin()) {
+        return _base->_view;
+    }
+
+    return StringView(
+        std::min(_value.end() + _base->_delimiter.length(), end), end);
+}
+
+void SplitView::Iterator::reset() {
+    _value = StringView(_base->_view.end(), _base->_view.end());
+}
+
+bool SplitView::Iterator::next() {
+    if (_value.begin() < _base->_view.end()) {
+        if (_base->_delimiter.length()) {
+            const auto end = _base->_view.end();
+
+            const auto after = after_delimiter(end);
+            const auto first = find_first(after, _base->_delimiter);
+            const auto found = first != after.end();
+
+            if (found) {
+                _value = StringView(after.begin(), first);
+            } else {
+                _value = StringView(after.begin(), end);
+            }
+
+            return found || _value.length();
+        }
+
+        const auto base = _base->_view;
+        if (_value.begin() < base.begin()) {
+            _value = base;
+            return true;
+        }
+
+        _value = base.slice(base.length());
+    }
+
+    return false;
+}
+
+SplitView::Iterator StatefulSplitView::find(StringView value) const {
+    auto it = _base.begin();
+    auto end = _base.end();
+
+    while (it != end) {
+        if ((*it) == value) {
+            break;
+        }
+
+        ++it;
+    }
+
+    return it;
+}
+
+SplitView::Iterator& SplitView::Iterator::operator++() {
+    next();
+    return *this;
+}
+
+SplitView::Iterator SplitView::Iterator::operator++(int) {
+    SplitView::Iterator out(*this);
+    out.next();
+    return out;
+}
+
+bool SplitView::Iterator::operator==(const SplitView::Iterator& other) const {
+    return _base == other._base
+        && _value.data() == other._value.data();
+}
+
+bool SplitView::Iterator::operator==(const SplitView::Iterator::End&) const {
+    return _value.begin() == _base->_view.end();
+}
+
+} // namespace espurna

@@ -7,18 +7,15 @@ Inspired by https://github.com/Vasil-Pahomov/ArWs2812 (currently https://github.
 
 #pragma once
 
-#if GARLAND_SUPPORT
-
-#include <vector>
-
 #include "color.h"
 
 class Palette {
    public:
-    Palette(const char* name, std::vector<Color>&& colors) : _name(name), _numColors(colors.size()), _colors(std::move(colors)), _cache(256) {
+    Palette(const char* name, bool bright, std::vector<Color>&& colors) : _name(name), _bright(bright), _numColors(colors.size()), _colors(std::move(colors)), _cache(256) {
     }
 
     const char* name() const { return _name; }
+    const bool bright() const { return _bright; }
 
     /**
     * Get the interpolated color from the palette.
@@ -35,11 +32,11 @@ class Palette {
     }
 
     Color getCachedPalColor(byte i) {
-        if (!_cache[i].empty())
+        if (!_cache[i].is_empty())
             return _cache[i];
 
         Color col = getPalColor((float)i / 256);
-        if (col.empty())
+        if (col.is_empty())
             col = 1;
 
         _cache[i] = col;
@@ -85,11 +82,34 @@ class Palette {
         return bestColor;
     }
 
+    Color getCleanColor(uint16_t i) const {
+        return _colors[i % _numColors];
+    }
+
+    Color getCloseCleanColor(const Color& refColor) const {
+        int bestDiff = 0;
+        Color bestColor;
+
+        for (auto i = 0; i < _numColors; ++i) {
+            Color newColor = _colors[i];
+            int diff = refColor.howCloseTo(newColor);
+            if (bestDiff < diff) {
+                bestDiff = diff;
+                bestColor = newColor;
+            }
+        }
+        return bestColor;
+    }
+
+    Color getRndCleanColor() const {
+        return _colors[secureRandom(_numColors)];
+    }
+
+
    private:
     const char* _name;
-    const int _numColors;
+    const bool _bright;
+    const uint16_t _numColors;
     std::vector<Color> _colors;
     std::vector<Color> _cache;
 };
-
-#endif  // GARLAND_SUPPORT

@@ -1,51 +1,70 @@
 // -----------------------------------------------------------------------------
 // Moving Average Filter
 // Copyright (C) 2017-2019 by Xose Pérez <xose dot perez at gmail dot com>
+// Copyright (C) 2023-2024 by Maxim Prokhorov <prokhorov dot max at outlook dot com>
 // -----------------------------------------------------------------------------
-
-#if SENSOR_SUPPORT
 
 #pragma once
 
-#include <vector>
 #include "BaseFilter.h"
 
+#include <cstdio>
+#include <vector>
+#include <numeric>
+
 class MovingAverageFilter : public BaseFilter {
-
-    public:
-
-        void add(double value) {
-            _sum = _sum + value - _data[_pointer];
-            _data[_pointer] = value;
-            _pointer = (_pointer + 1) % _size;
+public:
+    void update(double value) override {
+        if (!_size) {
+            return;
         }
 
-        unsigned char count() {
-            return _pointer;
+        if (_size == _values.size()) {
+            _values.erase(_values.begin());
         }
 
-        void reset() {}
+        _values.push_back(value);
+    }
 
-        double result() {
-            return _sum;
+    bool available() const override {
+        return _values.size() > 0;
+    }
+
+    bool ready() const override {
+        return (_size > 0)
+            && (_values.size() == _size);
+    }
+
+    double value() const override {
+        if (!_values.size()) {
+            return 0.0;
         }
 
-        void resize(unsigned char size) {
-            if (_size == size) return;
-            _size = size;
-            if (_data) delete _data;
-            _data = new double[_size];
-            for (unsigned char i=0; i<_size; i++) _data[i] = 0;
-            _pointer = 0;
-            _sum = 0;
+        return std::accumulate(_values.begin(), _values.end(), 0.0)
+             / _values.size();
+    }
+
+    void resize(size_t size) override {
+        if (!size) {
+            _values.clear();
+            _values.shrink_to_fit();
+        } else if (size < _size) {
+            _values.erase(
+                _values.begin(),
+                _values.begin() + (_size - size));
+            _values.shrink_to_fit();
+        } else if (size > _size) {
+            _values.reserve(size);
         }
 
-    protected:
+        _size = size;
+    }
 
-        unsigned char _pointer = 0;
-        double _sum = 0;
-        double * _data = NULL;
+    void reset() override {
+        _values.clear();
+    }
 
+private:
+    std::vector<double> _values {};
+    size_t _size { 0 };
 };
-
-#endif // SENSOR_SUPPORT
